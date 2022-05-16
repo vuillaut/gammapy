@@ -1,5 +1,5 @@
 # Compiled files
-*.py[co]
+*.py[cod]
 *.a
 *.o
 *.so
@@ -13,7 +13,9 @@ __pycache__
 */version.py
 */cython_version.py
 htmlcov
-.coverage
+.coverage*
+.coverage.subprocess
+.hypothesis
 
 # Sphinx
 _build
@@ -21,6 +23,8 @@ _build
 # Pytest
 .cache
 v
+.pytest_cache
+.tox
 
 # Packages/installer info
 *.egg
@@ -46,6 +50,7 @@ distribute-*.tar.gz
 # Mac OSX
 .DS_Store
 
+.vscode
 .idea
 .settings
 .pydevproject
@@ -54,8 +59,23 @@ htmlcov
 MANIFEST
 
 # notebooks
-*.ipynb
 *.ipynb_checkpoints
+docs/_static/notebooks
+docs/_downloads/notebooks-dev.tar
+docs/modeling/gallery
+
+docs/tutorials/analysis/3D/crab-3datasets
+docs/tutorials/starting/analysis_1
+docs/tutorials/analysis/3D/analysis_3d
+docs/tutorials/analysis/3D/event_sampling
+docs/tutorials/*/*.yaml
+docs/tutorials/*.yaml
+docs/tutorials/*/*.dat
+docs/tutorials/*.dat
+docs/tutorials/*/*.reg
+
+gammapy-datasets
+temp
 
 gammapy/gammapy.cfg
 
@@ -65,8 +85,17 @@ docs/api
 
 dev/crab
 
-# Data files and images are usually generated
-*.png
+# Data files generated in docs building
+#!tutorials/images/*
+#*.png
 *.fits
 *.fits.gz
 *.root
+
+# Linting
+.trunk
+.flake8
+.isort.cfg
+.shellcheckrc
+.hadolint.yaml
+.markdownlint.yaml

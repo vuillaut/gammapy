@@ -1,255 +1,566 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
+import abc
+import collections.abc
+import copy
 import logging
-import sys
-import os
-import shutil
-from collections import OrderedDict
-from astropy.table import Table
-import astropy.utils.data
-from ..extern.pathlib import Path
-
-__all__ = [
-    'Datasets',
-    'gammapy_extra',
-]
+import numpy as np
+from astropy import units as u
+from astropy.table import Table, vstack
+from gammapy.data import GTI
+from gammapy.modeling.models import DatasetModels, Models
+from gammapy.utils.scripts import make_name, make_path, read_yaml, write_yaml
+from gammapy.utils.table import table_from_row_data
 
 log = logging.getLogger(__name__)
 
-# This is the cross-platform way to get the HOME directory, also in Windows
-# https://docs.python.org/3/library/pathlib.html#pathlib.Path.home
-# http://stackoverflow.com/a/4028943
-DATASET_DIR = Path.home() / '.gammapy/datasets'
+
+__all__ = ["Dataset", "Datasets"]
 
 
-def download_file(url, filename, overwrite=False, mkdir=True, show_progress=True, timeout=None):
-    """Download a URL to a given filename.
+class Dataset(abc.ABC):
+    """Dataset abstract base class.
 
-    This is a wrapper for the `astropy.utils.data.download_file` function,
-    that allows moving the file to a given location if the download is successful.
+    TODO: add tutorial how to create your own dataset types.
 
-    This function also creates directories as needed.
+    For now, see existing examples in Gammapy how this works:
 
-    Parameters
-    ----------
-    TODO
+    - `gammapy.datasets.MapDataset`
+    - `gammapy.datasets.SpectrumDataset`
+    - `gammapy.datasets.FluxPointsDataset`
     """
-    filename = Path(filename)
 
-    if filename.is_file() and not overwrite:
-        return
+    _residuals_labels = {
+        "diff": "data - model",
+        "diff/model": "(data - model) / model",
+        "diff/sqrt(model)": "(data - model) / sqrt(model)",
+    }
 
-    if not filename.parent.is_dir() and mkdir:
-        filename.parent.mkdir(parents=True)
+    @property
+    @abc.abstractmethod
+    def tag(self):
+        pass
 
-    # This saves the file to a temp folder, with `cache=False` the Astropy cache isn't touched!
-    temp_filename = astropy.utils.data.download_file(
-        remote_url=url, cache=False, show_progress=show_progress, timeout=timeout)
+    @property
+    def name(self):
+        return self._name
 
-    shutil.move(temp_filename, str(filename))
+    def to_dict(self):
+        """Convert to dict for YAML serialization."""
+        name = self.name.replace(" ", "_")
+        filename = f"{name}.fits"
+        return {"name": self.name, "type": self.tag, "filename": filename}
 
-    return filename
+    @property
+    def mask(self):
+        """Combined fit and safe mask"""
+        if self.mask_safe is not None and self.mask_fit is not None:
+            return self.mask_safe & self.mask_fit
+        elif self.mask_fit is not None:
+            return self.mask_fit
+        elif self.mask_safe is not None:
+            return self.mask_safe
 
+    def stat_sum(self):
+        """Total statistic given the current model parameters."""
+        stat = self.stat_array()
 
-def make_dataset(config):
-    """Dataset factory function.
-    """
-    # For not we just have simple datasets
-    name = config['name']
-    filename = DATASET_DIR / config['filename']
-    url = config.get('url')
-    description = config.get('description')
-    tags = config.get('tags')
-    ds = OneFileDataset(
-        name=name,
-        filename=filename,
-        url=url,
-        description=description,
-        tags=tags
-    )
-    return ds
+        if self.mask is not None:
+            stat = stat[self.mask.data]
 
+        return np.sum(stat, dtype=np.float64)
 
-class OneFileDataset(object):
-    """One file simple dataset."""
+    @abc.abstractmethod
+    def stat_array(self):
+        """Statistic array, one value per data point."""
 
-    def __init__(self, name, filename, url=None, description=None, tags=None):
-        self.name = name
-        self.filename = filename
-        self.url = url
-        self.description = description
-        self.tags = tags
-
-    def fetch(self, overwrite=False):
-        download_file(url=self.url, filename=self.filename, overwrite=overwrite)
-
-    def is_available(self):
-        return Path(self.filename).is_file()
-
-    def info(self, file=None):
-        if not file:
-            file = sys.stdout
-
-        print(self.__dict__, file=file)
-        self._print_status(file=file)
-
-    def _print_status(self, file):
-        available = 'yes' if self.is_available() else 'no'
-        print('Available: {}'.format(available), file=file)
-
-
-class Datasets(object):
-    """Download and access for all built-in datasets.
-
-    TODO: this isn't used much at the moment and not documented.
-    I added this before I decided to add `gammapy_extra`,
-    and then this class wasn't needed to access datasets for tests.
-
-    We still need something like this to manage files that aren't
-    in gammapy-extra, e.g. large files from the web that we don't
-    want to stick in gammapy-extra.
-
-    This class has overlap with the `gammapy.data.DataManager` class ...
-    maybe it should be merged or maybe it's better to keep that one
-    focused on HESS (and Fermi?) data management?
-
-    Parameters
-    ----------
-    config : `~collections.OrderedDict`
-        Data manager configuration.
-
-    Attributes
-    ----------
-    datasets : list of `Dataset` objects
-        List of datasets
-    """
-    # DEFAULT_CONFIG_FILE = Path.home() / '.gammapy/data-register.yaml'
-    DEFAULT_CONFIG_FILE = astropy.utils.data.get_pkg_data_filename('datasets.yaml')
-
-    def __init__(self, config=None):
-        if not config:
-            filename = Datasets.DEFAULT_CONFIG_FILE
-            config = Datasets._load_config(filename)
-
-        self.config = config
-
-        self.datasets = OrderedDict()
-        for dataset_config in config:
-            dataset = make_dataset(dataset_config)
-            self.datasets[dataset.name] = dataset
-
-    @classmethod
-    def from_yaml(cls, filename):
-        """Create a `DataManager` from a YAML config file.
+    def copy(self, name=None):
+        """A deep copy.
 
         Parameters
         ----------
-        filename : str
-            YAML config file
+        name : str
+            Name of the copied dataset
+
+        Returns
+        -------
+        dataset : `Dataset`
+            Copied datasets.
         """
-        config = Datasets._load_config(filename)
-        return cls(config=config)
+        new = copy.deepcopy(self)
+        name = make_name(name)
+        new._name = name
+        # TODO: check the model behaviour?
+        new.models = None
+        return new
 
     @staticmethod
-    def _load_config(filename):
-        import yaml
-        with Path(filename).open() as fh:
-            config = yaml.safe_load(fh)
-        return config
+    def _compute_residuals(data, model, method="diff"):
+        with np.errstate(invalid="ignore"):
+            if method == "diff":
+                residuals = data - model
+            elif method == "diff/model":
+                residuals = (data - model) / model
+            elif method == "diff/sqrt(model)":
+                residuals = (data - model) / np.sqrt(model)
+            else:
+                raise AttributeError(
+                    f"Invalid method: {method!r} for computing residuals"
+                )
+        return residuals
 
-    def info(self, verbose=False, file=None):
-        """Print basic info."""
-        if not file:
-            file = sys.stdout
 
-        print('Number of datasets: {}'.format(len(self.datasets)), file=file)
+class Datasets(collections.abc.MutableSequence):
+    """Dataset collection.
 
-        self.info_table.pprint()
+    Parameters
+    ----------
+    datasets : `Dataset` or list of `Dataset`
+        Datasets
+    """
 
-        if verbose:
-            for dataset in self.datasets.values():
-                dataset.info(file=file)
+    def __init__(self, datasets=None):
+        if datasets is None:
+            datasets = []
+
+        if isinstance(datasets, Datasets):
+            datasets = datasets._datasets
+        elif isinstance(datasets, Dataset):
+            datasets = [datasets]
+        elif not isinstance(datasets, list):
+            raise TypeError(f"Invalid type: {datasets!r}")
+
+        unique_names = []
+        for dataset in datasets:
+            if dataset.name in unique_names:
+                raise (ValueError("Dataset names must be unique"))
+            unique_names.append(dataset.name)
+
+        self._datasets = datasets
 
     @property
-    def info_table(self):
-        rows = []
-        for ds in self.datasets.values():
-            row = dict()
-            row['Name'] = ds.name
-            row['Available'] = 'yes' if ds.is_available() else 'no'
-            row['Filename'] = ds.filename
+    def parameters(self):
+        """Unique parameters (`~gammapy.modeling.Parameters`).
+
+        Duplicate parameter objects have been removed.
+        The order of the unique parameters remains.
+        """
+        return self.models.parameters.unique_parameters
+
+    @property
+    def models(self):
+        """Unique models (`~gammapy.modeling.Models`).
+
+        Duplicate model objects have been removed.
+        The order of the unique models remains.
+        """
+        models = {}
+
+        for dataset in self:
+            if dataset.models is not None:
+                for model in dataset.models:
+                    models[model] = model
+
+        return DatasetModels(list(models.keys()))
+
+    @models.setter
+    def models(self, models):
+        """Unique models (`~gammapy.modeling.Models`).
+
+        Duplicate model objects have been removed.
+        The order of the unique models remains.
+        """
+        for dataset in self:
+            dataset.models = models
+
+    @property
+    def names(self):
+        return [d.name for d in self._datasets]
+
+    @property
+    def is_all_same_type(self):
+        """Whether all contained datasets are of the same type"""
+        return len(set(_.__class__ for _ in self)) == 1
+
+    @property
+    def is_all_same_shape(self):
+        """Whether all contained datasets have the same data shape"""
+        return len(set(_.data_shape for _ in self)) == 1
+
+    @property
+    def is_all_same_energy_shape(self):
+        """Whether all contained datasets have the same data shape"""
+        return len(set(_.data_shape[0] for _ in self)) == 1
+
+    @property
+    def energy_axes_are_aligned(self):
+        """Whether all contained datasets have aligned energy axis"""
+        axes = [d.counts.geom.axes["energy"] for d in self]
+        return np.all([axes[0].is_aligned(ax) for ax in axes])
+
+    @property
+    def contributes_to_stat(self):
+        """Stat contributions
+
+        Returns
+        -------
+        contributions : `~numpy.array`
+            Array indicating which dataset contributes to the likelihood.
+        """
+        contributions = []
+
+        for dataset in self:
+            if dataset.mask is not None:
+                value = np.any(dataset.mask)
+            else:
+                value = True
+            contributions.append(value)
+        return np.array(contributions)
+
+    def stat_sum(self):
+        """Compute joint likelihood"""
+        stat_sum = 0
+        # TODO: add parallel evaluation of likelihoods
+        for dataset in self:
+            stat_sum += dataset.stat_sum()
+        return stat_sum
+
+    def select_time(self, time_min, time_max, atol="1e-6 s"):
+        """Select datasets in a given time interval.
+
+        Parameters
+        ----------
+        time_min, time_max : `~astropy.time.Time`
+            Time interval
+        atol : `~astropy.units.Quantity`
+            Tolerance value for time comparison with different scale. Default 1e-6 sec.
+
+        Returns
+        -------
+        datasets : `Datasets`
+            Datasets in the given time interval.
+
+        """
+        atol = u.Quantity(atol)
+
+        datasets = []
+
+        for dataset in self:
+            t_start = dataset.gti.time_start[0]
+            t_stop = dataset.gti.time_stop[-1]
+
+            if t_start >= (time_min - atol) and t_stop <= (time_max + atol):
+                datasets.append(dataset)
+
+        return self.__class__(datasets)
+
+    def slice_by_energy(self, energy_min, energy_max):
+        """Select and slice datasets in energy range
+
+        The method keeps the current dataset names. Datasets, that do not
+        contribute to the selected energy range are dismissed.
+
+        Parameters
+        ----------
+        energy_min, energy_max : `~astropy.units.Quantity`
+            Energy bounds to compute the flux point for.
+
+        Returns
+        -------
+        datasets : Datasets
+            Datasets
+
+        """
+        datasets = []
+
+        for dataset in self:
+            try:
+                dataset_sliced = dataset.slice_by_energy(
+                    energy_min=energy_min,
+                    energy_max=energy_max,
+                    name=dataset.name,
+                )
+            except ValueError:
+                log.info(
+                    f"Dataset {dataset.name} does not contribute in the energy range"
+                )
+                continue
+
+            datasets.append(dataset_sliced)
+
+        return self.__class__(datasets=datasets)
+
+    def to_spectrum_datasets(self, region):
+        """Extract spectrum datasets for the given region.
+
+        Parameters
+        ----------
+        region : `~regions.SkyRegion`
+            Region definition.
+
+        Returns
+        -------
+        datasets : `Datasets`
+            List of `~gammapy.datasets.SpectrumDataset`
+        """
+        datasets = Datasets()
+
+        for dataset in self:
+            spectrum_dataset = dataset.to_spectrum_dataset(
+                on_region=region, name=dataset.name
+            )
+            datasets.append(spectrum_dataset)
+
+        return datasets
+
+    @property
+    # TODO: make this a method to support different methods?
+    def energy_ranges(self):
+        """Get global energy range of datasets.
+
+        The energy range is derived as the minimum / maximum of the energy
+        ranges of all datasets.
+
+        Returns
+        -------
+        energy_min, energy_max : `~astropy.units.Quantity`
+            Energy range.
+        """
+
+        energy_mins, energy_maxs = [], []
+
+        for dataset in self:
+            energy_axis = dataset.counts.geom.axes["energy"]
+            energy_mins.append(energy_axis.edges[0])
+            energy_maxs.append(energy_axis.edges[-1])
+
+        return u.Quantity(energy_mins), u.Quantity(energy_maxs)
+
+    def __str__(self):
+        str_ = self.__class__.__name__ + "\n"
+        str_ += "--------\n\n"
+
+        for idx, dataset in enumerate(self):
+            str_ += f"Dataset {idx}: \n\n"
+            str_ += f"\tType       : {dataset.tag}\n"
+            str_ += f"\tName       : {dataset.name}\n"
+            try:
+                instrument = set(dataset.meta_table["TELESCOP"]).pop()
+            except (KeyError, TypeError):
+                instrument = ""
+            str_ += f"\tInstrument : {instrument}\n"
+            if dataset.models:
+                names = dataset.models.names
+            else:
+                names = ""
+            str_ += f"\tModels     : {names}\n\n"
+
+        return str_.expandtabs(tabsize=2)
+
+    def copy(self):
+        """A deep copy."""
+        return copy.deepcopy(self)
+
+    @classmethod
+    def read(cls, filename, filename_models=None, lazy=True, cache=True):
+        """De-serialize datasets from YAML and FITS files.
+
+        Parameters
+        ----------
+        filename : str or `Path`
+            File path or name of datasets yaml file
+        filename_models : str or `Path`
+            File path or name of models fyaml ile
+        lazy : bool
+            Whether to lazy load data into memory
+        cache : bool
+            Whether to cache the data after loading.
+
+        Returns
+        -------
+        dataset : `gammapy.datasets.Datasets`
+            Datasets
+        """
+        from . import DATASET_REGISTRY
+
+        filename = make_path(filename)
+        data_list = read_yaml(filename)
+
+        datasets = []
+        for data in data_list["datasets"]:
+            path = filename.parent
+
+            if (path / data["filename"]).exists():
+                data["filename"] = str(make_path(path / data["filename"]))
+
+            dataset_cls = DATASET_REGISTRY.get_cls(data["type"])
+            dataset = dataset_cls.from_dict(data, lazy=lazy, cache=cache)
+            datasets.append(dataset)
+
+        datasets = cls(datasets)
+
+        if filename_models:
+            datasets.models = Models.read(filename_models)
+
+        return datasets
+
+    def write(
+        self, filename, filename_models=None, overwrite=False, write_covariance=True
+    ):
+        """Serialize datasets to YAML and FITS files.
+
+        Parameters
+        ----------
+        filename : str or `Path`
+            File path or name of datasets yaml file
+        filename_models : str or `Path`
+            File path or name of models yaml file
+        overwrite : bool
+            overwrite datasets FITS files
+        write_covariance : bool
+            save covariance or not
+        """
+        path = make_path(filename)
+
+        data = {"datasets": []}
+
+        for dataset in self._datasets:
+            d = dataset.to_dict()
+            filename = d["filename"]
+            dataset.write(path.parent / filename, overwrite=overwrite)
+            data["datasets"].append(d)
+
+        write_yaml(data, path, sort_keys=False)
+
+        if filename_models:
+            self.models.write(
+                filename_models,
+                overwrite=overwrite,
+                write_covariance=write_covariance,
+            )
+
+    def stack_reduce(self, name=None, nan_to_num=True):
+        """Reduce the Datasets to a unique Dataset by stacking them together.
+
+        This works only if all Dataset are of the same type and if a proper
+        in-place stack method exists for the Dataset type.
+
+        Parameters
+        ----------
+        name : str
+            Name of the stacked dataset.
+        nan_to_num: bool
+            Non-finite values are replaced by zero if True (default).
+
+        Returns
+        -------
+        dataset : `~gammapy.datasets.Dataset`
+            the stacked dataset
+        """
+        if not self.is_all_same_type:
+            raise ValueError(
+                "Stacking impossible: all Datasets contained are not of a unique type."
+            )
+
+        stacked = self[0].to_masked(name=name, nan_to_num=nan_to_num)
+
+        for dataset in self[1:]:
+            stacked.stack(dataset, nan_to_num=nan_to_num)
+
+        return stacked
+
+    def info_table(self, cumulative=False):
+        """Get info table for datasets.
+
+        Parameters
+        ----------
+        cumulative : bool
+            Cumulate info across all observations
+
+        Returns
+        -------
+        info_table : `~astropy.table.Table`
+            Info table.
+        """
+        if not self.is_all_same_type:
+            raise ValueError("Info table not supported for mixed dataset type.")
+
+        name = "stacked" if cumulative else self[0].name
+        stacked = self[0].to_masked(name=name)
+
+        rows = [stacked.info_dict()]
+
+        for dataset in self[1:]:
+            if cumulative:
+                stacked.stack(dataset)
+                row = stacked.info_dict()
+            else:
+                row = dataset.info_dict()
+
             rows.append(row)
 
-        table = Table(rows=rows, names=['Name', 'Available', 'Filename'])
-        return table
+        return table_from_row_data(rows=rows)
 
-    def __getitem__(self, name):
-        return self.datasets[name]
+    # TODO: merge with meta table?
+    @property
+    def gti(self):
+        """GTI table"""
+        time_intervals = []
 
-    def fetch_one(self, name):
-        """Fetch one dataset.
-        """
-        dataset = self.datasets[name]
-        dataset.fetch()
+        for dataset in self:
+            if dataset.gti is not None and len(dataset.gti.table) > 0:
+                interval = (dataset.gti.time_start[0], dataset.gti.time_stop[-1])
+                time_intervals.append(interval)
 
-    def fetch_all(self, tags='catalog'):
-        """Fetch all datasets that match one of the tags.
-        """
-        for dataset in self.datasets.values():
-            if not dataset.tags:
-                continue
-            if set(dataset.tags) & set(tags):
-                dataset.fetch()
+        if len(time_intervals) == 0:
+            return None
 
-
-class GammapyExtraNotFoundError(OSError):
-    """The gammapy-extra repo is not available.
-
-    You have to set the GAMMAPY_EXTRA environment variable so that it's found.
-    """
-    pass
-
-
-class _GammapyExtra(object):
-    """Access files from gammapy-extra repo.
-
-    You have to set the `GAMMAPY_EXTRA` environment variable
-    so that it's found.
-    """
+        return GTI.from_time_intervals(time_intervals)
 
     @property
-    def is_available(self):
-        """Is the gammapy-extra repo available?"""
-        if 'GAMMAPY_EXTRA' in os.environ:
-            # Make sure this is really pointing to a gammapy-extra folder
-            filename = Path(os.environ['GAMMAPY_EXTRA']) / 'logo/gammapy_logo.pdf'
-            if filename.is_file():
-                return True
+    def meta_table(self):
+        """Meta table"""
+        tables = [d.meta_table for d in self]
 
-        return False
-
-    @property
-    def dir(self):
-        """Path to the gammapy-extra repo.
-
-        Raises `GammapyExtraNotFoundError` if gammapy-extra isn't found.
-        """
-        if self.is_available:
-            return Path(os.environ['GAMMAPY_EXTRA'])
+        if np.all([table is None for table in tables]):
+            meta_table = Table()
         else:
-            msg = 'The gammapy-extra repo is not available. '
-            msg += 'You have to set the GAMMAPY_EXTRA environment variable '
-            msg += 'to point to the location for it to be found.'
-            raise GammapyExtraNotFoundError(msg)
+            meta_table = vstack(tables)
 
-    def filename(self, filename):
-        """Filename in gammapy-extra as string.
-        """
-        return str(self.dir / filename)
+        meta_table.add_column([d.tag for d in self], index=0, name="TYPE")
+        meta_table.add_column(self.names, index=0, name="NAME")
+        return meta_table
 
+    def __getitem__(self, key):
+        return self._datasets[self.index(key)]
 
-gammapy_extra = _GammapyExtra()
-"""Module-level variable to access gammapy-extra.
+    def __delitem__(self, key):
+        del self._datasets[self.index(key)]
 
-TODO: usage examples
-"""
+    def __setitem__(self, key, dataset):
+        if isinstance(dataset, Dataset):
+            if dataset.name in self.names:
+                raise (ValueError("Dataset names must be unique"))
+            self._datasets[self.index(key)] = dataset
+        else:
+            raise TypeError(f"Invalid type: {type(dataset)!r}")
+
+    def insert(self, idx, dataset):
+        if isinstance(dataset, Dataset):
+            if dataset.name in self.names:
+                raise (ValueError("Dataset names must be unique"))
+            self._datasets.insert(idx, dataset)
+        else:
+            raise TypeError(f"Invalid type: {type(dataset)!r}")
+
+    def index(self, key):
+        if isinstance(key, (int, slice)):
+            return key
+        elif isinstance(key, str):
+            return self.names.index(key)
+        elif isinstance(key, Dataset):
+            return self._datasets.index(key)
+        else:
+            raise TypeError(f"Invalid type: {type(key)!r}")
+
+    def __len__(self):
+        return len(self._datasets)

@@ -1,396 +1,166 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-"""FITS utility functions.
-"""
-from __future__ import absolute_import, division, print_function, unicode_literals
-from collections import OrderedDict
-import numpy as np
-from astropy.units import Quantity
+import logging
+import sys
+import astropy.units as u
+from astropy.coordinates import Angle, EarthLocation
 from astropy.io import fits
-from astropy.table import Table, QTable
+from astropy.units import Quantity
 from .scripts import make_path
-from .energy import EnergyBounds
 
-__all__ = [
-    'SmartHDUList',
-    'table_from_row_data',
-    'table_to_fits_table',
-    'fits_table_to_table',
-    'energy_axis_to_ebounds',
-]
+log = logging.getLogger(__name__)
+
+__all__ = ["earth_location_from_dict", "LazyFitsData", "HDULocation"]
 
 
-# TODO: decide what to call this class.
-# Would `FITSFile` be better than `SmartHDUList`?
-class SmartHDUList(object):
-    """A FITS HDU list wrapper with some sugar.
+class HDULocation:
+    """HDU localisation, loading and Gammapy object mapper.
 
-    This is a thin wrapper around `~astropy.io.fits.HDUList`,
-    with some conveniences built in.
+    This represents one row in `HDUIndexTable`.
+
+    It's more a helper class, that is wrapped by `~gammapy.data.Observation`,
+    usually those objects will be used to access data.
+
+    See also :ref:`gadf:hdu-index`.
+    """
+
+    def __init__(
+        self,
+        hdu_class,
+        base_dir=".",
+        file_dir=None,
+        file_name=None,
+        hdu_name=None,
+        cache=True,
+        format=None,
+    ):
+        self.hdu_class = hdu_class
+        self.base_dir = base_dir
+        self.file_dir = file_dir
+        self.file_name = file_name
+        self.hdu_name = hdu_name
+        self.cache = cache
+        self.format = format
+
+    def info(self, file=None):
+        """Print some summary info to stdout."""
+        if not file:
+            file = sys.stdout
+        print(f"HDU_CLASS = {self.hdu_class}", file=file)
+        print(f"BASE_DIR = {self.base_dir}", file=file)
+        print(f"FILE_DIR = {self.file_dir}", file=file)
+        print(f"FILE_NAME = {self.file_name}", file=file)
+        print(f"HDU_NAME = {self.hdu_name}", file=file)
+
+    def path(self, abs_path=True):
+        """Full filename path.
+
+        Include ``base_dir`` if ``abs_path`` is True.
+        """
+        path = make_path(self.base_dir) / self.file_dir / self.file_name
+
+        if abs_path and path.exists():
+            return path
+        else:
+            return make_path(self.file_dir) / self.file_name
+
+    def get_hdu(self):
+        """Get HDU."""
+        filename = self.path(abs_path=True)
+        # Here we're intentionally not calling `with fits.open`
+        # because we don't want the file to remain open.
+        hdu_list = fits.open(str(filename), memmap=False)
+        return hdu_list[self.hdu_name]
+
+    def load(self):
+        """Load HDU as appropriate class.
+
+        TODO: this should probably go via an extensible registry.
+        """
+        from gammapy.irf import IRF_REGISTRY
+
+        hdu_class = self.hdu_class
+        filename = self.path()
+        hdu = self.hdu_name
+
+        if hdu_class == "events":
+            from gammapy.data import EventList
+
+            return EventList.read(filename, hdu=hdu)
+        elif hdu_class == "gti":
+            from gammapy.data import GTI
+
+            return GTI.read(filename, hdu=hdu)
+        elif hdu_class == "map":
+            from gammapy.maps import Map
+
+            return Map.read(filename, hdu=hdu, format=self.format)
+        else:
+            cls = IRF_REGISTRY.get_cls(hdu_class)
+
+            return cls.read(filename, hdu=hdu)
+
+
+class LazyFitsData(object):
+    """A lazy FITS data descriptor.
 
     Parameters
     ----------
-    hdu_list : `~astropy.io.fits.HDUList`
-        HDU list (stored in ``hdu_list`` attribute)
-
-    Examples
-    --------
-
-    Opening a SmartHDUList calls `astropy.io.fits.open` to get a `~astropy.io.fits.HDUList`
-    object, and then stores it away in the ``hdu_list`` attribute:
-
-    >>> from gammapy.utils.fits import SmartHDUList
-    >>> hdus = SmartHDUList.open('$GAMMAPY_EXTRA/datasets/catalogs/fermi/gll_psch_v08.fit.gz')
-    >>> type(hdus.hdu_list)
-    astropy.io.fits.hdu.hdulist.HDUList
-
-    So of course, you can do the usual things via ``hdus.hdu_list``:
-
-    >>> hdus.hdu_list.filename()
-    >>> hdus.hdu_list.info()
-    >>> [hdu.name for hdu in hdus.hdu_list]
-
-    In addition, for a `SmartHDUList`, it's easier to get the HDUs you want:
-
-    >>> hdus.get_hdu('Extended Sources')  # by name
-    >>> hdus.get_hdu(2)  # by index
-    >>> hdus.get_hdu(hdu_type='image')  # first image (skip primary if empty)
-    >>> hdus.get_hdu(hdu_type='table')  # first table
-
-    TODO: add more conveniences, e.g. to create HDU lists from lists of Gammapy
-    objects that can be serialised to FITS (e.g. SkyImage, SkyCube, EventList, ...)
+    cache : bool
+        Whether to cache the data.
     """
 
-    def __init__(self, hdu_list):
-        self.hdu_list = hdu_list
+    def __init__(self, cache=True):
+        self.cache = cache
 
-    @classmethod
-    def open(cls, filename, **kwargs):
-        """Create from FITS file (`SmartHDUList`).
+    def __set_name__(self, owner, name):
+        self.name = name
 
-        This calls `astropy.io.fits.open`, passing ``**kwargs``.
-        It reads the FITS headers, but not the data.
+    def __get__(self, instance, objtype):
+        if instance is None:
+            # Accessed on a class, not an instance
+            return self
 
-        The ``filename`` is passed through `~gammapy.utils.scripts.make_path`,
-        which accepts strings or Path objects and does environment variable expansion.
+        try:
+            return instance.__dict__[self.name]
+        except KeyError:
+            hdu_loc = instance.__dict__[f"_{self.name}_hdu"]
+            try:
+                value = hdu_loc.load()
+            except KeyError:
+                value = None
+                log.warning(f"HDU '{hdu_loc.hdu_name}' not found")
+            if self.cache and hdu_loc.cache:
+                instance.__dict__[self.name] = value
+            return value
 
-        Parameters
-        ----------
-        filename : `str`
-            Filename
-        """
-        filename = str(make_path(filename))
-        hdu_list = fits.open(filename, **kwargs)
-        return cls(hdu_list)
-
-    def write(self, filename, **kwargs):
-        """Write HDU list to FITS file.
-
-        This calls `astropy.io.fits.HDUList.writeto`, passing ``**kwargs``.
-
-        The ``filename`` is passed through `~gammapy.utils.scripts.make_path`,
-        which accepts strings or Path objects and does environment variable expansion.
-
-        Parameters
-        ----------
-        filename : `str`
-            Filename
-        """
-        filename = str(make_path(filename))
-        self.hdu_list.writeto(filename, **kwargs)
-
-    @property
-    def names(self):
-        """List of HDU names (stripped, upper-case)."""
-        return [hdu.name.strip().upper() for hdu in self.hdu_list]
-
-    def get_hdu_index(self, hdu=None, hdu_type=None):
-        """Get index of HDU with given name, number or type.
-
-        If ``hdu`` is given, tries to find an HDU of that given name or number.
-        Otherwise, if ``hdu_type`` is given, looks for the first suitable HDU.
-
-        Raises ``KeyError`` if no suitable HDU is found.
-
-        Parameters
-        ----------
-        hdu : int or str
-            HDU number or name, passed to `astropy.io.fits.HDUList.index_of`.
-        hdu_type : {'primary', 'image' , 'table'}
-            Type of HDU to load
-
-        Returns
-        -------
-        idx : int
-            HDU index
-        """
-        # For the external API, we want the argument name to be `hdu`
-        # But in this method, it's confusing because later we'll have
-        # actual HDU objects. So we rename here: `hdu` -> `hdu_key`
-        hdu_key = hdu
-        del hdu
-
-        if (hdu_key is None) and (hdu_type is None):
-            raise ValueError('Must give either `hdu` or `hdu_type`. Got `None` for both.')
-
-        # if (hdu_key is not None) and (hdu_type is not None):
-        #     raise ValueError(
-        #         'Must give either `hdu` or `hdu_type`.'
-        #         ' Got a value for both: hdu={} and hdu_type={}'
-        #         ''.format(hdu_key, hdu_type)
-        #     )
-
-        if hdu_key is not None:
-            idx = self.hdu_list.index_of(hdu_key)
-            # `HDUList.index_of` for integer input doesn't raise, just return
-            # the number unchanged. Here we want to raise an error in this case.
-            if not (0 <= idx < len(self.hdu_list)):
-                raise KeyError('HDU not found: hdu={}. Index out of range.'.format(hdu_key))
-            return idx
-
-        if hdu_type is not None:
-            for hdu_idx, hdu_object in enumerate(self.hdu_list):
-                if hdu_type == 'primary':
-                    if isinstance(hdu_object, fits.PrimaryHDU):
-                        return hdu_idx
-                elif hdu_type == 'image':
-                    # The `hdu.shape` check is used to skip empty `PrimaryHDU`
-                    # with no data. Those aren't very useful, now, are they?
-                    if hdu_object.is_image and len(hdu_object.shape) > 0:
-                        return hdu_idx
-                elif hdu_type == 'table':
-                    if isinstance(hdu_object, fits.BinTableHDU):
-                        return hdu_idx
-                else:
-                    raise ValueError('Invalid hdu_type={}'.format(hdu_type))
-
-        raise KeyError('HDU not found: hdu={}, hdu_type={}'.format(hdu_key, hdu_type))
-
-    def get_hdu(self, hdu=None, hdu_type=None):
-        """Get HDU with given name, number or type.
-
-        This method simply calls ``get_hdu_index(hdu, hdu_type)``,
-        and if successful, returns the HDU for that given index.
-        """
-        index = self.get_hdu_index(hdu=hdu, hdu_type=hdu_type)
-        hdu = self.hdu_list[index]
-        return hdu
+    def __set__(self, instance, value):
+        if isinstance(value, HDULocation):
+            instance.__dict__[f"_{self.name}_hdu"] = value
+        else:
+            instance.__dict__[self.name] = value
 
 
-def split_filename_hduname(location):
-    """Get one HDU for a given location.
-
-    location should be either a ``file_name`` or a file
-    and HDU name in the format ``file_name[hdu_name]``.
-
-    Parameters
-    ----------
-    TODO
-
-    Returns
-    -------
-    TODO
-    """
-    # TODO: Test all cases and give good exceptions / error messages
-    if '[' in location:
-        tokens = location.split('[')
-        file_name = tokens[0]
-        hdu_name = tokens[1][:-1]  # split off ']' at the end
-        return fits.open(file_name)[hdu_name]
+# TODO: add unit test
+def earth_location_from_dict(meta):
+    """Create `~astropy.coordinates.EarthLocation` from FITS header dict."""
+    lon = Angle(meta["GEOLON"], "deg")
+    lat = Angle(meta["GEOLAT"], "deg")
+    # TODO: should we support both here?
+    # Check latest spec if ALTITUDE is used somewhere.
+    if "GEOALT" in meta:
+        height = Quantity(meta["GEOALT"], "meter")
+    elif "ALTITUDE" in meta:
+        height = Quantity(meta["ALTITUDE"], "meter")
     else:
-        file_name = location
-        return fits.open(file_name)[0]
+        raise KeyError("The GEOALT or ALTITUDE header keyword must be set")
+
+    return EarthLocation(lon=lon, lat=lat, height=height)
 
 
-def fits_header_to_meta_dict(header):
-    """Convert `astropy.io.fits.Header` to `~collections.OrderedDict`.
-
-    This is a lossy conversion, only key, value is stored
-    (and not e.g. comments for each FITS "card").
-    Also, "COMMENT" and "HISTORY" cards are completely removed.
-    """
-    meta = OrderedDict(header)
-
-    # Drop problematic header content, i.e. values of type
-    # `astropy.io.fits.header._HeaderCommentaryCards`
-    # Handling this well and preserving it is a bit complicated, see
-    # See https://github.com/astropy/astropy/blob/master/astropy/io/fits/connect.py
-    # for how `astropy.table.Table.read` does it
-    # and see https://github.com/gammapy/gammapy/issues/701
-    meta.pop('COMMENT', None)
-    meta.pop('HISTORY', None)
-
-    return meta
-
-
-# TODO: remove type = 'qtable' to avoid issues?
-# see https://github.com/astropy/astropy/issues/6098
-# see https://github.com/gammapy/gammapy/issues/980
-def table_from_row_data(rows, type='qtable', **kwargs):
-    """Helper function to create table objects from row data.
-
-    - Works with quantities.
-    - Preserves order of keys if OrderedDicts are used.
-
-    Parameters
-    ----------
-    rows : list
-        List of row data (each row a dict or OrderedDict)
-    type : {'table', 'qtable'}
-        Type of table to create
-    """
-    # Creating `QTable` from list of row data with `Quantity` objects
-    # doesn't work. So we're reformatting to list of column `Quantity`
-    # objects here.
-    # table = QTable(rows=rows)
-
-    if type == 'table':
-        cls = Table
-    elif type == 'qtable':
-        cls = QTable
-    else:
-        raise ValueError('Invalid type: {}'.format(type))
-
-    table = cls(**kwargs)
-    colnames = list(rows[0].keys())
-    for name in colnames:
-        coldata = [_[name] for _ in rows]
-        if isinstance(rows[0][name], Quantity):
-            coldata = Quantity(coldata, unit=rows[0][name].unit)
-        table[name] = coldata
-
-    return table
-
-
-def table_to_fits_table(table):
-    """Convert `~astropy.table.Table` to `astropy.io.fits.BinTableHDU`.
-
-    The name of the table can be stored in the Table meta information
-    under the ``name`` keyword.
-
-    Additional column information ``description`` and ``ucd`` can be stored
-    in the column.meta attribute and will be stored in the fits header.
-
-    Parameters
-    ----------
-    table : `~astropy.table.Table`
-        Table
-
-    Returns
-    -------
-    hdu : `~astropy.io.fits.BinTableHDU`
-        Binary table HDU
-    """
-    # read name and drop it from the meta information, otherwise
-    # it would be stored as a header keyword in the BinTableHDU
-    name = table.meta.pop('name', None)
-
-    table.convert_unicode_to_bytestring(python3_only=True)
-    data = table.as_array()
-
-    header = fits.Header()
-    header.update(table.meta)
-
-    hdu = fits.BinTableHDU(data, header, name=name)
-
-    # Copy over column meta-data
-    for idx, colname in enumerate(table.colnames):
-        # fix the order of the keywords
-        hdu.header['TTYPE' + str(idx + 1)] = hdu.header.pop('TTYPE' + str(idx + 1))
-        hdu.header['TFORM' + str(idx + 1)] = hdu.header.pop('TFORM' + str(idx + 1))
-
-        if table[colname].unit is not None:
-            hdu.header['TUNIT' + str(idx + 1)] = table[colname].unit.to_string('fits')
-
-        description = table[colname].meta.get('description')
-        if description:
-            hdu.header['TCOMM' + str(idx + 1)] = description
-
-        ucd = table[colname].meta.get('ucd')
-        if ucd:
-            hdu.header['TUCD' + str(idx + 1)] = ucd
-
-    # TODO: this method works fine but the order of keywords in the table
-    # header is not logical: for instance, list of keywords with column
-    # units (TUNITi) is appended after the list of column keywords
-    # (TTYPEi, TFORMi), instead of in between.
-    # As a matter of fact, the units aren't yet in the header, but
-    # only when calling the write method and opening the output file.
-    # https://github.com/gammapy/gammapy/issues/298
-
-    return hdu
-
-
-def fits_table_to_table(tbhdu):
-    """Convert astropy table to binary table FITS format.
-
-    This is a generic method to convert a `~astropy.io.fits.BinTableHDU`
-    to `~astropy.table.Table`.
-    The name of the table is stored in the Table meta information
-    under the ``name`` keyword.
-
-    Additional column information ``description`` and ``ucd`` can will be
-    read from the header and stored in the column.meta attribute.
-
-    Parameters
-    ----------
-    hdu : `~astropy.io.fits.BinTableHDU`
-        FITS bin table containing the astropy table columns
-
-    Returns
-    -------
-    table : `~astropy.table.Table`
-        astropy table containing the desired columns
-    """
-    data = tbhdu.data
-    header = tbhdu.header
-    table = Table(data, meta=header)
-
-    # Copy over column meta-data
-    for idx, colname in enumerate(tbhdu.columns.names):
-        table[colname].unit = tbhdu.columns[colname].unit
-        description = table.meta.pop('TCOMM' + str(idx + 1), None)
-        table[colname].meta['description'] = description
-        ucd = table.meta.pop('TUCD' + str(idx + 1), None)
-        table[colname].meta['ucd'] = ucd
-
-    return table
-
-
-def energy_axis_to_ebounds(energy):
-    """Convert `~gammapy.utils.energy.EnergyBounds` to OGIP ``EBOUNDS`` extension
-
-    see
-    http://heasarc.gsfc.nasa.gov/docs/heasarc/caldb/docs/memos/cal_gen_92_002/cal_gen_92_002.html#tth_sEc3.2
-    """
-    energy = EnergyBounds(energy)
-    table = Table()
-
-    table['CHANNEL'] = np.arange(energy.nbins, dtype=np.int16)
-    table['E_MIN'] = energy[:-1]
-    table['E_MAX'] = energy[1:]
-
-    hdu = table_to_fits_table(table)
-
-    header = hdu.header
-    header['EXTNAME'] = 'EBOUNDS', 'Name of this binary table extension'
-    header['TELESCOP'] = 'DUMMY', 'Mission/satellite name'
-    header['INSTRUME'] = 'DUMMY', 'Instrument/detector'
-    header['FILTER'] = 'None', 'Filter information'
-    header['CHANTYPE'] = 'PHA', 'Type of channels (PHA, PI etc)'
-    header['DETCHANS'] = energy.nbins, 'Total number of detector PHA channels'
-    header['HDUCLASS'] = 'OGIP', 'Organisation devising file format'
-    header['HDUCLAS1'] = 'RESPONSE', 'File relates to response of instrument'
-    header['HDUCLAS2'] = 'EBOUNDS', 'This is an EBOUNDS extension'
-    header['HDUVERS'] = '1.2.0', 'Version of file format'
-
-    return hdu
-
-
-def ebounds_to_energy_axis(ebounds):
-    """Convert ``EBOUNDS`` extension to `~gammapy.utils.energy.EnergyBounds`
-    """
-    table = fits_table_to_table(ebounds)
-    emin = table['E_MIN'].quantity
-    emax = table['E_MAX'].quantity
-    energy = np.append(emin.value, emax.value[-1]) * emin.unit
-    return EnergyBounds(energy)
+def earth_location_to_dict(location):
+    """Create `~astropy.coordinates.EarthLocation` from FITS header dict."""
+    return {
+        "GEOLON": location.lon.deg,
+        "GEOLAT": location.lat.deg,
+        "ALTITUDE": location.height.to_value(u.m),
+    }

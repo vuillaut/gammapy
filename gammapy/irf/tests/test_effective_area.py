@@ -1,119 +1,157 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
 import pytest
 import numpy as np
-import astropy.units as u
 from numpy.testing import assert_allclose, assert_equal
-from astropy.tests.helper import assert_quantity_allclose
-from ...utils.testing import requires_dependency, requires_data
-from ...irf.effective_area import EffectiveAreaTable2D, EffectiveAreaTable
+import astropy.units as u
+from gammapy.irf import EffectiveAreaTable2D
+from gammapy.maps import MapAxis
+from gammapy.utils.testing import (
+    assert_quantity_allclose,
+    mpl_plot_check,
+    requires_data,
+)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def aeff():
-    filename = '$GAMMAPY_EXTRA/datasets/hess-crab4-hd-hap-prod2/run023400-023599/run023523/hess_aeff_2d_023523.fits.gz'
-    return EffectiveAreaTable2D.read(filename, hdu='AEFF_2D')
+    filename = "$GAMMAPY_DATA/hess-dl3-dr1/data/hess_dl3_dr1_obs_id_023523.fits.gz"
+    return EffectiveAreaTable2D.read(filename, hdu="AEFF")
 
 
-@requires_dependency('scipy')
-@requires_dependency('matplotlib')
-@requires_data('gammapy-extra')
-def test_EffectiveAreaTable2D(aeff):
-    assert aeff.energy.nbins == 73
-    assert aeff.data.axis('offset').nbins == 6
-    assert aeff.data.data.shape == (73, 6)
+@requires_data()
+def test_basic(aeff):
+    assert aeff.axes["energy_true"].nbin == 96
+    assert aeff.axes["offset"].nbin == 6
+    assert aeff.data.shape == (96, 6)
 
-    assert aeff.energy.unit == 'TeV'
-    assert aeff.data.axis('offset').unit == 'deg'
-    assert aeff.data.data.unit == 'm2'
+    assert aeff.axes["energy_true"].unit == "TeV"
+    assert aeff.axes["offset"].unit == "deg"
+    assert aeff.unit == "m2"
 
-    assert_quantity_allclose(aeff.high_threshold, 99.083 * u.TeV, rtol=1e-3)
-    assert_quantity_allclose(aeff.low_threshold, 0.603 * u.TeV, rtol=1e-3)
+    assert_quantity_allclose(aeff.meta["HI_THRES"], 100, rtol=1e-3)
+    assert_quantity_allclose(aeff.meta["LO_THRES"], 0.870964, rtol=1e-3)
 
-    test_val = aeff.data.evaluate(energy='14 TeV', offset='0.2 deg')
-    assert_allclose(test_val.value, 740929.645, atol=1e-2)
-
-    aeff.plot()
-    aeff.plot_energy_dependence()
-    aeff.plot_offset_dependence()
-
-    # Test ARF export
-    offset = 0.236 * u.deg
-    e_axis = np.logspace(0, 1, 20) * u.TeV
-    effareafrom2d = aeff.to_effective_area_table(offset, e_axis)
-
-    energy = np.sqrt(e_axis[:-1] * e_axis[1:])
-    area = aeff.data.evaluate(energy=energy, offset=offset)
-    effarea1d = EffectiveAreaTable(energy_lo=e_axis[:-1],
-                                   energy_hi=e_axis[1:],
-                                   data=area)
-
-    actual = effareafrom2d.data.evaluate(energy='2.34 TeV')
-    desired = effarea1d.data.evaluate(energy='2.34 TeV')
-    assert_equal(actual, desired)
-
-    # Test ARF export #2
-    offset = 1.2 * u.deg
-    actual = aeff.to_effective_area_table(offset=offset).data.data
-    desired = aeff.data.evaluate(offset=offset)
-    assert_equal(actual.value, desired.value)
+    test_val = aeff.evaluate(energy_true="14 TeV", offset="0.2 deg")
+    assert_allclose(test_val.value, 683177.5, rtol=1e-3)
 
 
-@requires_dependency('scipy')
-@requires_dependency('matplotlib')
-@requires_data('gammapy-extra')
-def test_EffectiveAreaTable(tmpdir, aeff):
-    arf = aeff.to_effective_area_table(offset=0.3 * u.deg)
-
-    assert_quantity_allclose(arf.data.evaluate(), arf.data.data)
-
-    arf.plot()
-
-    filename = str(tmpdir / 'effarea_test.fits')
-    arf.write(filename)
-    arf2 = EffectiveAreaTable.read(filename)
-
-    assert_quantity_allclose(arf.data.evaluate(), arf2.data.evaluate())
-
-    test_aeff = 0.6 * arf.max_area
-    node_above = np.where(arf.data.data > test_aeff)[0][0]
-    energy = arf.energy
-    ener_above = energy.nodes[node_above]
-    ener_below = energy.nodes[node_above - 1]
-    test_ener = arf.find_energy(test_aeff)
-
-    assert ener_below < test_ener and test_ener < ener_above
-
-    elo_threshold = arf.find_energy(0.1 * arf.max_area)
-    assert_quantity_allclose(elo_threshold, 0.43669092057562997 * u.TeV)
-
-    # Test evaluation outside safe range
-    data = [np.nan, np.nan, 0, 0, 1, 2, 3, np.nan, np.nan]
-    energy = np.logspace(0, 10, 10) * u.TeV
-    aeff = EffectiveAreaTable(data=data,
-                              energy_lo=energy[:-1],
-                              energy_hi=energy[1:])
-    vals = aeff.evaluate_fill_nan()
-    assert vals[1] == 0
-    assert vals[-1] == 3
-
-
-def test_EffectiveAreaTable_from_parametrization():
+def test_from_parametrization():
     # Log center of this is 100 GeV
-    energy = [80, 125] * u.GeV
-    area_ref = 1.65469579e+07 * u.cm ** 2
+    area_ref = 1.65469579e07 * u.cm**2
 
-    area = EffectiveAreaTable.from_parametrization(energy, 'HESS')
+    axis = MapAxis.from_energy_edges([80, 125] * u.GeV, name="energy_true")
+    area = EffectiveAreaTable2D.from_parametrization(axis, "HESS")
 
-    assert_allclose(area.data.data, area_ref)
-    assert area.data.data.unit == area_ref.unit
+    assert_allclose(area.quantity, area_ref)
+    assert area.unit == area_ref.unit
 
     # Log center of this is 0.1, 2 TeV
-    energy = [0.08, 0.125, 32] * u.TeV
-    area_ref = [1.65469579e+07, 1.46451957e+09] * u.cm * u.cm
+    area_ref = [1.65469579e07, 1.46451957e09] * u.cm * u.cm
 
-    area = EffectiveAreaTable.from_parametrization(energy, 'HESS')
-    assert_allclose(area.data.data, area_ref)
-    assert area.data.data.unit == area_ref.unit
+    axis = MapAxis.from_energy_edges([0.08, 0.125, 32] * u.TeV, name="energy_true")
+    area = EffectiveAreaTable2D.from_parametrization(axis, "HESS")
+    assert_allclose(area.quantity[:, 0], area_ref)
+    assert area.unit == area_ref.unit
+    assert area.meta["TELESCOP"] == "HESS"
 
-    # TODO: Use this to test interpolation behaviour etc.
+
+@requires_data()
+def test_plot(aeff):
+    with mpl_plot_check():
+        aeff.plot()
+
+    with mpl_plot_check():
+        aeff.plot_energy_dependence()
+
+    with mpl_plot_check():
+        aeff.plot_offset_dependence()
+
+
+def test_to_table():
+    energy_axis_true = MapAxis.from_energy_bounds(
+        "1 TeV", "10 TeV", nbin=10, name="energy_true"
+    )
+
+    offset_axis = MapAxis.from_bounds(0, 1, nbin=4, name="offset", unit="deg")
+
+    aeff = EffectiveAreaTable2D(
+        axes=[energy_axis_true, offset_axis], data=1, unit="cm2"
+    )
+    hdu = aeff.to_table_hdu()
+    assert_equal(hdu.data["ENERG_LO"][0], aeff.axes["energy_true"].edges[:-1].value)
+    assert hdu.header["TUNIT1"] == aeff.axes["energy_true"].unit
+
+
+def test_to_table_is_pointlike():
+    energy_axis = MapAxis.from_energy_bounds(
+        "1 TeV", "10 TeV", nbin=3, name="energy_true"
+    )
+    offset_axis = MapAxis.from_bounds(0 * u.deg, 2 * u.deg, nbin=2, name="offset")
+
+    aeff = EffectiveAreaTable2D(
+        data=np.ones((3, 2)) * u.m**2, axes=[energy_axis, offset_axis]
+    )
+    hdu = aeff.to_table_hdu()
+    assert "is_pointlike" not in hdu.header
+
+
+def test_wrong_axis_order():
+    energy_axis_true = MapAxis.from_energy_bounds(
+        "1 TeV", "10 TeV", nbin=10, name="energy_true"
+    )
+
+    offset = np.linspace(0, 1, 4) * u.deg
+    offset_axis = MapAxis.from_nodes(offset, name="offset")
+
+    data = np.ones(shape=(offset_axis.nbin, energy_axis_true.nbin))
+
+    with pytest.raises(ValueError):
+        EffectiveAreaTable2D(
+            axes=[energy_axis_true, offset_axis], data=data, unit="cm2"
+        )
+
+
+def test_wrong_units():
+    energy_axis_true = MapAxis.from_energy_bounds(
+        "1 TeV", "10 TeV", nbin=10, name="energy_true"
+    )
+
+    offset_axis = MapAxis.from_bounds(0 * u.deg, 2 * u.deg, nbin=2, name="offset")
+
+    wrong_unit = u.TeV
+    data = np.ones((energy_axis_true.nbin, offset_axis.nbin)) * wrong_unit
+    area_test = EffectiveAreaTable2D(axes=[energy_axis_true, offset_axis])
+
+    with pytest.raises(ValueError) as error:
+        EffectiveAreaTable2D(data=data, axes=[energy_axis_true, offset_axis])
+
+        assert error.match(
+            f"Error: {wrong_unit} is not an allowed unit. {area_test.tag} requires {area_test.default_unit} data quantities."
+        )
+
+
+@requires_data("gammapy-data")
+def test_aeff2d_pointlike():
+    filename = "$GAMMAPY_DATA/joint-crab/dl3/magic/run_05029748_DL3.fits"
+
+    aeff = EffectiveAreaTable2D.read(filename)
+    hdu = aeff.to_table_hdu()
+
+    assert aeff.is_pointlike
+    assert hdu.header["HDUCLAS3"] == "POINT-LIKE"
+
+
+def test_eq():
+    energy1 = MapAxis.from_energy_bounds("1 TeV", "10 TeV", nbin=2, name="energy_true")
+
+    energy2 = MapAxis.from_energy_bounds("1 TeV", "10 TeV", nbin=3, name="energy_true")
+
+    offset_axis = MapAxis.from_bounds(0 * u.deg, 2 * u.deg, nbin=2, name="offset")
+
+    data1 = np.ones((energy1.nbin, offset_axis.nbin)) * u.cm**2
+    data2 = np.ones((energy2.nbin, offset_axis.nbin)) * u.cm**2
+
+    aeff1 = EffectiveAreaTable2D(data=data1, axes=[energy1, offset_axis])
+    aeff2 = EffectiveAreaTable2D(data=data2, axes=[energy2, offset_axis])
+
+    assert not aeff1 == aeff2

@@ -3,45 +3,59 @@
 IRF Theory
 ==========
 
-TODO: do a detailed writeup of how IRFs are implemented and used in Gammapy.
+Modeling the expected number of detected events
+-----------------------------------------------
 
-For high-level gamma-ray data analysis (measuring morphology and spectra of sources)
-a canonical detector model is used, where the gamma-ray detection process is simplified
-as being fully characterized by the following three "instrument response functions":
+To model the expected number of events a gamma-ray source should produce on a detector
+one has to model its effect using an instrument response function (IRF). In general,
+such a function gives the probability to detect a photon emitted from true position :math:`p_{\rm true}`
+on the sky and true energy :math:`E_{\rm true}` at reconstructed position :math:`p` and energy
+:math:`E` and the effective collection area of the detector at position :math:`p_{\rm true}`
+on the sky and true energy :math:`E_{\rm true}`.
 
-* Effective area :math:`A(p, E)` (unit: :math:`m^2`)
-* Point spread function :math:`PSF(p'|p, E)` (unit: :math:`sr^{-1}`)
-* Energy dispersion :math:`D(E'|p, E)` (unit: :math:`TeV^{-1}`)
-
-The effective area represents the gamma-ray detection efficiency,
-the PSF the angular resolution and the energy dispersion the energy resolution
-of the instrument.
-
-The full instrument response is given by
+We can write the expected number of detected events  :math:`N(p, E)`:
 
 .. math::
 
-   R(p', E'|p, E) = A(p, E) \times PSF(p'|p, E) \times D(E'|p, E),
+   N(p, E) {\rm d}p {\rm d}E = 
+   t_{\rm obs} \int_{E_{\rm true}} {\rm d}E_{\rm true} \, \int_{p_{\rm true}} {\rm d}p_{\rm true} \, R(p, E|p_{\rm true}, E_{\rm true}) \times \Phi(p_{\rm true}, E_{\rm true})
 
-where :math:`p` and :math:`E` are the true gamma-ray position and energy
-and :math:`p'` and :math:`E'` are the reconstructed gamma-ray position and energy.
+where:
 
-The instrument function relates sky flux models to expected observed counts distributions via
+* :math:`R(p, E| p_{\rm true}, E_{\rm true})` is the instrument response  (unit: :math:`{\rm m}^2\,{\rm TeV}^{-1}`)
+* :math:`\Phi(p_{\rm true}, E_{\rm true})` is the sky flux model  (unit: :math:`{\rm m}^{-2}\,{\rm s}^{-1}\,{\rm TeV}^{-1}\,{\rm sr}^{-1}`)
+* :math:`t_{\rm obs}` is the observation time:  (unit: :math:`{\rm s}`)
+
+
+The Instrument Response Functions
+---------------------------------
+
+Most of the time, in high level gamma-ray data (DL3), we assume that the instrument response can
+be simplified as the product of three independent functions:
 
 .. math::
 
-   N(p', E') = t_{obs} \int_E \int_\Omega R(p', E'|p, E) \times F(p, E) dp dE,
+   R(p, E|p_{\rm true}, E_{\rm true}) = A_{\rm eff}(p_{\rm true}, E_{\rm true}) \times PSF(p|p_{\rm true}, E_{\rm true}) \times E_{\rm disp}(E|p_{\rm true}, E_{\rm true}),
 
-where :math:`F`, :math:`R`, :math:`t_{obs}` and :math:`N` are the following quantities:
+where:
 
-* Sky flux model :math:`F(p, E)` (unit: :math:`m^{-2} s^{-1} TeV^{-1} sr^{-1}`)
-* Instrument response :math:`R(p', E'|p, E)` (unit: :math:`m^2 TeV^{-1} sr^{-1}`)
-* Observation time: :math:`t_{obs}` (unit: :math:`s`)
-* Expected observed counts model :math:`N(p', E')` (unit: :math:`sr^{-1} TeV^{-1}`)
+* :math:`A_{\rm eff}(p_{\rm true}, E_{\rm true})` is the effective collection area of the detector  (unit: :math:`{\rm m}^2`). It is the product
+  of the detector collection area times its detection efficiency at true energy :math:`E_{\rm true}` and position :math:`p_{\rm true}`.
+* :math:`PSF(p|p_{\rm true}, E_{\rm true})` is the point spread function (unit: :math:`{\rm sr}^{-1}`). It gives the probability of
+  measuring a direction :math:`p` when the true direction is :math:`p_{\rm true}` and the true energy is :math:`E_{\rm true}`.
+  Gamma-ray instruments consider the probability density of the angular separation between true and reconstructed directions 
+  :math:`\delta p = p_{\rm true} - p`, i.e. :math:`PSF(\delta p|p_{\rm true}, E_{\rm true})`.
+* :math:`E_{\rm disp}(E|p_{\rm true}, E_{\rm true})` is the energy dispersion (unit: :math:`{\rm TeV}^{-1}`). It gives the probability to
+  reconstruct the photon at energy :math:`E` when the true energy is :math:`E_{\rm true}` and the true position :math:`p_{\rm true}`.
+  Gamma-ray instruments consider the probability density of the migration :math:`\mu=\frac{E}{E_{\rm true}}`, 
+  i.e. :math:`E_{\rm disp}(\mu|p_{\rm true}, E_{\rm true})`.
 
-If you'd like to learn more about instrument response functions, have a look at the descriptions for
-`Fermi <http://fermi.gsfc.nasa.gov/ssc/data/analysis/documentation/Cicerone/Cicerone_LAT_IRFs/index.html>`__,
-for `TeV data analysis <http://inspirehep.net/record/1122589>`__
-and for `GammaLib <http://gammalib.sourceforge.net/user_manual/modules/obs.html#handling-the-instrument-response>`__.
+The implicit assumption here is that energy dispersion and PSF are completely independent. This is not totally
+valid in some situations.
 
-TODO: add an overview of what is / isn't available in Gammapy.
+These functions are obtained through Monte-Carlo simulations of gamma-ray showers for different observing conditions,
+e.g.  detector configuration, zenith angle of the pointing position, detector state and different event reconstruction
+and selection schemes. In the DL3 format, the IRF are distributed for each observing run.
+
+Further details on individuals responses and how they are implemented in gammapy are given in :ref:`irf-aeff`,
+:ref:`irf-edisp` and :ref:`irf-psf`.

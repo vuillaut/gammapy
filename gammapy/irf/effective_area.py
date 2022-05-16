@@ -1,449 +1,73 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
-from collections import OrderedDict
 import numpy as np
 import astropy.units as u
-from astropy.io import fits
-from astropy.table import Table
-from ..utils.nddata import NDDataArray, BinnedDataAxis
-from ..utils.energy import EnergyBounds
-from ..utils.scripts import make_path
-from ..utils.fits import fits_table_to_table, table_to_fits_table
+from astropy.visualization import quantity_support
+import matplotlib.pyplot as plt
+from gammapy.maps import MapAxes, MapAxis
+from .core import IRF
 
-__all__ = [
-    'EffectiveAreaTable',
-    'EffectiveAreaTable2D',
-]
+__all__ = ["EffectiveAreaTable2D"]
 
 
-class EffectiveAreaTable(object):
-    """Effective area table.
-
-    TODO: Document
-
-    Parameters
-    -----------
-    energy_lo : `~astropy.units.Quantity`
-        Lower bin edges of energy axis
-    energy_hi : `~astropy.units.Quantity`
-        Upper bin edges of energy axis
-    data : `~astropy.units.Quantity`
-        Effective area
-
-    Examples
-    --------
-    Plot parametrized effective area for HESS, HESS2 and CTA.
-
-    .. plot::
-        :include-source:
-
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import astropy.units as u
-        from gammapy.irf import EffectiveAreaTable
-
-        energy = np.logspace(-3, 3, 100) * u.TeV
-
-        for instrument in ['HESS', 'HESS2', 'CTA']:
-            aeff = EffectiveAreaTable.from_parametrization(energy, instrument)
-            ax = aeff.plot(label=instrument)
-
-        ax.set_yscale('log')
-        ax.set_xlim([1e-3, 1e3])
-        ax.set_ylim([1e3, 1e12])
-        plt.legend(loc='best')
-        plt.show()
-
-    Find energy where the effective area is at 10% of its maximum value
-
-    >>> import numpy as np
-    >>> import astropy.units as u
-    >>> from gammapy.irf import EffectiveAreaTable
-    >>> energy = np.logspace(-1, 2) * u.TeV
-    >>> aeff_max = aeff.max_area
-    >>> print(aeff_max).to('m2')
-    156909.413371 m2
-    >>> energy_threshold = aeff.find_energy(0.1 * aeff_max)
-    >>> print(energy_threshold)
-    0.185368478744 TeV
-    """
-
-    def __init__(self, energy_lo, energy_hi, data, meta=None):
-        axes = [BinnedDataAxis(energy_lo, energy_hi,
-                               interpolation_mode='log', name='energy')]
-        self.data = NDDataArray(axes=axes, data=data)
-        self.meta = OrderedDict(meta) if meta else OrderedDict()
-
-    @property
-    def energy(self):
-        return self.data.axis('energy')
-
-    def plot(self, ax=None, energy=None, show_energy=None, **kwargs):
-        """Plot effective area.
-
-        Parameters
-        ----------
-        ax : `~matplotlib.axes.Axes`, optional
-            Axis
-        energy : `~astropy.units.Quantity`
-            Energy nodes
-        show_energy : `~astropy.units.Quantity`, optional
-            Show energy, e.g. threshold, as vertical line
-
-        Returns
-        -------
-        ax : `~matplotlib.axes.Axes`
-            Axis
-        """
-        import matplotlib.pyplot as plt
-        ax = plt.gca() if ax is None else ax
-
-        kwargs.setdefault('lw', 2)
-
-        if energy is None:
-            energy = self.energy.nodes
-        eff_area = self.data.evaluate(energy=energy)
-        xerr = (energy.value - self.energy.lo.value,
-                self.energy.hi.value - energy.value)
-        ax.errorbar(energy.value, eff_area.value, xerr=xerr, **kwargs)
-        if show_energy is not None:
-            ener_val = u.Quantity(show_energy).to(self.energy.unit).value
-            ax.vlines(ener_val, 0, 1.1 * self.max_area.value,
-                      linestyles='dashed')
-        ax.set_xscale('log')
-        ax.set_xlabel('Energy [{}]'.format(self.energy.unit))
-        ax.set_ylabel('Effective Area [{}]'.format(self.data.data.unit))
-
-        return ax
-
-    @classmethod
-    def from_parametrization(cls, energy, instrument='HESS'):
-        """Get parametrized effective area.
-
-        Parametrizations of the effective areas of different Cherenkov
-        telescopes taken from Appendix B of Abramowski et al. (2010), see
-        http://adsabs.harvard.edu/abs/2010MNRAS.402.1342A .
-
-        .. math::
-            A_{eff}(E) = g_1 \\left(\\frac{E}{\\mathrm{MeV}}\\right)^{-g_2}\\exp{\\left(-\\frac{g_3}{E}\\right)}
-
-        Parameters
-        ----------
-        energy : `~astropy.units.Quantity`
-            Energy binning, analytic function is evaluated at log centers
-        instrument : {'HESS', 'HESS2', 'CTA'}
-            Instrument name
-        """
-        energy = EnergyBounds(energy)
-        # Put the parameters g in a dictionary.
-        # Units: g1 (cm^2), g2 (), g3 (MeV)
-        # Note that whereas in the paper the parameter index is 1-based,
-        # here it is 0-based
-        pars = {'HESS': [6.85e9, 0.0891, 5e5],
-                'HESS2': [2.05e9, 0.0891, 1e5],
-                'CTA': [1.71e11, 0.0891, 1e5]}
-
-        if instrument not in pars.keys():
-            ss = 'Unknown instrument: {}\n'.format(instrument)
-            ss += 'Valid instruments: HESS, HESS2, CTA'
-            raise ValueError(ss)
-
-        xx = energy.log_centers.to('MeV').value
-
-        g1 = pars[instrument][0]
-        g2 = pars[instrument][1]
-        g3 = -pars[instrument][2]
-
-        value = g1 * xx ** (-g2) * np.exp(g3 / xx)
-
-        data = value * u.cm ** 2
-
-        return cls(
-            energy_lo=energy.lower_bounds,
-            energy_hi=energy.upper_bounds,
-            data=data,
-        )
-
-    @classmethod
-    def from_table(cls, table):
-        """Create from `~astropy.table.Table` in ARF format.
-
-        Data format specification: :ref:`gadf:ogip-arf`        
-        """
-        energy_lo = table['ENERG_LO'].quantity
-        energy_hi = table['ENERG_HI'].quantity
-        data = table['SPECRESP'].quantity
-        return cls(energy_lo=energy_lo, energy_hi=energy_hi, data=data)
-
-    @classmethod
-    def from_hdulist(cls, hdulist, hdu='SPECRESP'):
-        """Create from `~astropy.io.fits.HDUList`."""
-        fits_table = hdulist[hdu]
-        table = fits_table_to_table(fits_table)
-        return cls.from_table(table)
-
-    @classmethod
-    def read(cls, filename, hdu='SPECRESP', **kwargs):
-        """Read from file."""
-        filename = make_path(filename)
-        hdulist = fits.open(str(filename), **kwargs)
-        try:
-            return cls.from_hdulist(hdulist, hdu=hdu)
-        except KeyError:
-            msg = 'File {} contains no HDU "{}"'.format(filename, hdu)
-            msg += '\n Available {}'.format([_.name for _ in hdulist])
-            raise ValueError(msg)
-
-    def to_table(self):
-        """Convert to `~astropy.table.Table` in ARF format.
-
-        Data format specification: :ref:`gadf:ogip-arf`
-        """
-        table = Table()
-        table.meta = OrderedDict([
-            ('name', 'SPECRESP'),
-            ('hduclass', 'OGIP'),
-            ('hduclas1', 'RESPONSE'),
-            ('hduclas2', 'SPECRESP'),
-        ])
-        table['ENERG_LO'] = self.energy.lo
-        table['ENERG_HI'] = self.energy.hi
-        table['SPECRESP'] = self.evaluate_fill_nan()
-        return table
-
-    def to_hdulist(self):
-        """Convert to `~astropy.io.fits.HDUList`."""
-        hdu = table_to_fits_table(self.to_table())
-        prim_hdu = fits.PrimaryHDU()
-        return fits.HDUList([prim_hdu, hdu])
-
-    def write(self, filename, **kwargs):
-        """Write to file."""
-        filename = make_path(filename)
-        self.to_hdulist().writeto(str(filename), **kwargs)
-
-    def evaluate_fill_nan(self, **kwargs):
-        """Modified evaluate function.
-
-        Calls :func:`gammapy.utils.nddata.NDDataArray.evaluate` and replaces
-        possible nan values. Below the finite range the effective area is set
-        to zero and above to value of the last valid note. This is needed since
-        other codes, e.g. sherpa, don't like nan values in FITS files. Make
-        sure that the replacement happens outside of the energy range, where
-        the `~gammapy.irf.EffectiveAreaTable` is used.
-        """
-        retval = self.data.evaluate(**kwargs)
-        idx = np.where(np.isfinite(retval))[0]
-        retval[np.arange(idx[0])] = 0
-        retval[np.arange(idx[-1], len(retval))] = retval[idx[-1]]
-        return retval
-
-    @property
-    def max_area(self):
-        """Maximum effective area."""
-        cleaned_data = self.data.data[np.where(~np.isnan(self.data.data))]
-        return cleaned_data.max()
-
-    def find_energy(self, aeff, reverse=False):
-        """Find energy for given effective area.
-
-        A linear interpolation is performed between the two nodes closest to
-        the desired effective area value. By default, the first match is
-        returned (use `reverse` to search starting from the end of the array)
-
-        TODO: Move to `~gammapy.utils.nddata.NDDataArray`
-
-        Parameters
-        ----------
-        aeff : `~astropy.units.Quantity`
-            Effective area value
-        reverse : bool
-            Reverse the direction, i.e. search starting from the end of the array
-
-        Returns
-        -------
-        energy : `~astropy.units.Quantity`
-            Energy corresponding to aeff
-        """
-        valid = np.where(self.data.data > aeff)[0]
-        idx = valid[0]
-        if reverse:
-            idx = valid[-1]
-
-        if not reverse:
-            # Return lower edge if first bin is selected
-            if idx == 0:
-                energy = self.energy.lo[idx].value
-            # Perform linear interpolation otherwise
-            else:
-                energy = np.interp(aeff.value,
-                                   (self.data.data[[idx - 1, idx]].value),
-                                   (self.energy.nodes[[idx - 1, idx]].value))
-        else:
-            # Return upper edge if last bin is selected
-            if idx == self.data.data.size - 1:
-                energy = self.energy.hi[idx].value
-            # Perform linear interpolation otherwise
-            else:
-                energy = np.interp(aeff.value,
-                                   (self.data.data[[idx, idx + 1]].value),
-                                   (self.energy.nodes[[idx, idx + 1]].value))
-        return energy * self.energy.unit
-
-    def to_sherpa(self, name):
-        """Convert to `~sherpa.astro.data.DataARF`
-
-        Parameters
-        ----------
-        name : str
-            Instance name
-        """
-        from sherpa.astro.data import DataARF
-        table = self.to_table()
-        return DataARF(
-            name=name,
-            energ_lo=table['ENERG_LO'].quantity.to('keV').value,
-            energ_hi=table['ENERG_HI'].quantity.to('keV').value,
-            specresp=table['SPECRESP'].quantity.to('cm2').value,
-        )
-
-
-class EffectiveAreaTable2D(object):
+class EffectiveAreaTable2D(IRF):
     """2D effective area table.
 
     Data format specification: :ref:`gadf:aeff_2d`
 
     Parameters
-    -----------
-    energy_lo, energy_hi : `~astropy.units.Quantity`
-        Energy binning
-    offset_lo, offset_hi : `~astropy.units.Quantity`
-        Field of view offset angle.
+    ----------
+    energy_axis_true : `MapAxis`
+        True energy axis
+    offset_axis : `MapAxis`
+        Field of view offset axis.
     data : `~astropy.units.Quantity`
         Effective area
+    meta : dict
+        Meta data
 
     Examples
     --------
     Here's an example you can use to learn about this class:
 
     >>> from gammapy.irf import EffectiveAreaTable2D
-    >>> filename = '$GAMMAPY_EXTRA/test_datasets/cta_1dc/caldb/data/cta/prod3b/bcf/South_z20_50h/irf_file.fits'
+    >>> filename = '$GAMMAPY_DATA/cta-1dc/caldb/data/cta/1dc/bcf/South_z20_50h/irf_file.fits'
     >>> aeff = EffectiveAreaTable2D.read(filename, hdu='EFFECTIVE AREA')
     >>> print(aeff)
     EffectiveAreaTable2D
-    NDDataArray summary info
-    energy         : size =    21, min =  0.016 TeV, max = 158.489 TeV
-    offset         : size =     6, min =  0.500 deg, max =  5.500 deg
-    Data           : size =   126, min =  0.000 m2, max = 4263992.500 m2
-
+    --------------------
+    <BLANKLINE>
+      axes  : ['energy_true', 'offset']
+      shape : (42, 6)
+      ndim  : 2
+      unit  : m2
+      dtype : >f4
+    <BLANKLINE>
 
     Here's another one, created from scratch, without reading a file:
 
     >>> from gammapy.irf import EffectiveAreaTable2D
-    >>> import astropy.units as u
-    >>> import numpy as np
-    >>> energy = np.logspace(0,1,11) * u.TeV
-    >>> offset = np.linspace(0,1,4) * u.deg
-    >>> data = np.ones(shape=(10,4)) * u.cm * u.cm
-    >>> aeff = EffectiveAreaTable2D(energy=energy, offset=offset, data= data)
+    >>> from gammapy.maps import MapAxis
+    >>> energy_axis_true = MapAxis.from_energy_bounds("0.1 TeV", "100 TeV", nbin=30, name="energy_true")
+    >>> offset_axis = MapAxis.from_bounds(0, 5, nbin=4, name="offset")
+    >>> aeff = EffectiveAreaTable2D(axes=[energy_axis_true, offset_axis], data=1e10, unit="cm2")
     >>> print(aeff)
-    Data array summary info
-    energy         : size =    11, min =  1.000 TeV, max = 10.000 TeV
-    offset         : size =     4, min =  0.000 deg, max =  1.000 deg
-    Data           : size =    40, min =  1.000 cm2, max =  1.000 cm2
+    EffectiveAreaTable2D
+    --------------------
+    <BLANKLINE>
+      axes  : ['energy_true', 'offset']
+      shape : (30, 4)
+      ndim  : 2
+      unit  : cm2
+      dtype : float64
+    <BLANKLINE>
+
     """
-    default_interp_kwargs = dict(bounds_error=False, fill_value=None)
-    """Default Interpolation kwargs for `~NDDataArray`. Extrapolate."""
 
-    def __init__(self, energy_lo, energy_hi, offset_lo, offset_hi, data,
-                 meta=None, interp_kwargs=None):
+    tag = "aeff_2d"
+    required_axes = ["energy_true", "offset"]
+    default_unit = u.m**2
 
-        if interp_kwargs is None:
-            interp_kwargs = self.default_interp_kwargs
-        axes = [
-            BinnedDataAxis(
-                energy_lo, energy_hi,
-                interpolation_mode='log', name='energy'),
-            BinnedDataAxis(
-                offset_lo, offset_hi,
-                interpolation_mode='linear', name='offset')
-        ]
-        self.data = NDDataArray(axes=axes, data=data,
-                                interp_kwargs=interp_kwargs)
-        self.meta = OrderedDict(meta) if meta else OrderedDict()
-
-    def __str__(self):
-        ss = self.__class__.__name__
-        ss += '\n{}'.format(self.data)
-        return ss
-
-    @property
-    def energy(self):
-        return self.data.axis('energy')
-
-    @property
-    def offset(self):
-        return self.data.axis('offset')
-
-    @property
-    def low_threshold(self):
-        """Low energy threshold"""
-        return self.meta['LO_THRES'] * u.TeV
-
-    @property
-    def high_threshold(self):
-        """High energy threshold"""
-        return self.meta['HI_THRES'] * u.TeV
-
-    @classmethod
-    def from_table(cls, table):
-        """Read from `~astropy.table.Table`."""
-        return cls(
-            energy_lo=table['ENERG_LO'].quantity[0],
-            energy_hi=table['ENERG_HI'].quantity[0],
-            offset_lo=table['THETA_LO'].quantity[0],
-            offset_hi=table['THETA_HI'].quantity[0],
-            data=table['EFFAREA'].quantity[0].transpose(),
-            meta=table.meta,
-        )
-
-    @classmethod
-    def from_hdulist(cls, hdulist, hdu='EFFECTIVE AREA'):
-        """Create from `~astropy.io.fits.HDUList`."""
-        fits_table = hdulist[hdu]
-        table = fits_table_to_table(fits_table)
-        return cls.from_table(table)
-
-    @classmethod
-    def read(cls, filename, hdu='EFFECTIVE AREA'):
-        """Read from file."""
-        filename = make_path(filename)
-        hdulist = fits.open(str(filename))
-        return cls.from_hdulist(hdulist, hdu=hdu)
-
-    def to_effective_area_table(self, offset, energy=None):
-        """Evaluate at a given offset and return `~gammapy.irf.EffectiveAreaTable`.
-
-        Parameters
-        ----------
-        offset : `~astropy.coordinates.Angle`
-            Offset
-        energy : `~astropy.units.Quantity`
-            Energy axis bin edges
-        """
-        if energy is None:
-            energy = self.energy.bins
-
-        energy = EnergyBounds(energy)
-        area = self.data.evaluate(offset=offset, energy=energy.log_centers)
-
-        return EffectiveAreaTable(
-            energy_lo=energy.lower_bounds,
-            energy_hi=energy.upper_bounds,
-            data=area,
-        )
-
-    def plot_energy_dependence(self, ax=None, offset=None, energy=None, **kwargs):
+    def plot_energy_dependence(self, ax=None, offset=None, **kwargs):
         """Plot effective area versus energy for a given offset.
 
         Parameters
@@ -452,8 +76,6 @@ class EffectiveAreaTable2D(object):
             Axis
         offset : `~astropy.coordinates.Angle`
             Offset
-        energy : `~astropy.units.Quantity`
-            Energy axis
         kwargs : dict
             Forwarded tp plt.plot()
 
@@ -462,111 +84,163 @@ class EffectiveAreaTable2D(object):
         ax : `~matplotlib.axes.Axes`
             Axis
         """
-        import matplotlib.pyplot as plt
-
         ax = plt.gca() if ax is None else ax
 
         if offset is None:
-            off_min, off_max = self.data.axis('offset').nodes[[0, -1]].value
-            offset = np.linspace(off_min, off_max, 4) * self.data.axis('offset').unit
+            off_min, off_max = self.axes["offset"].bounds
+            offset = np.linspace(off_min, off_max, 4)
 
-        if energy is None:
-            energy = self.energy.nodes
+        energy_axis = self.axes["energy_true"]
 
         for off in offset:
-            area = self.data.evaluate(offset=off, energy=energy)
-            label = 'offset = {:.1f}'.format(off)
-            ax.plot(energy, area.value, label=label, **kwargs)
+            area = self.evaluate(offset=off, energy_true=energy_axis.center)
+            label = kwargs.pop("label", f"offset = {off:.1f}")
+            with quantity_support():
+                ax.plot(energy_axis.center, area, label=label, **kwargs)
 
-        ax.set_xscale('log')
-        ax.set_xlabel('Energy [{}]'.format(self.energy.unit))
-        ax.set_ylabel('Effective Area [{}]'.format(self.data.data.unit))
-        ax.set_xlim(min(energy.value), max(energy.value))
-        ax.legend(loc='upper left')
-
+        energy_axis.format_plot_xaxis(ax=ax)
+        ax.set_ylabel(f"Effective Area [{ax.yaxis.units}]")
+        ax.legend()
         return ax
 
-    def plot_offset_dependence(self, ax=None, offset=None, energy=None, **kwargs):
+    def plot_offset_dependence(self, ax=None, energy=None, **kwargs):
         """Plot effective area versus offset for a given energy.
 
         Parameters
         ----------
         ax : `~matplotlib.axes.Axes`, optional
             Axis
-        offset : `~astropy.coordinates.Angle`
-            Offset axis
-        energy : `~gammapy.utils.energy.Energy`
+        energy : `~astropy.units.Quantity`
             Energy
+        **kwargs : dict
+            Keyword argument passed to `~matplotlib.pyplot.plot`
 
         Returns
         -------
         ax : `~matplotlib.axes.Axes`
             Axis
         """
-        import matplotlib.pyplot as plt
-
         ax = plt.gca() if ax is None else ax
 
         if energy is None:
-            e_min, e_max = np.log10(self.energy.nodes[[0, -1]].value)
-            energy = np.logspace(e_min, e_max, 4) * self.energy.unit
+            energy_axis = self.axes["energy_true"]
+            e_min, e_max = energy_axis.center[[0, -1]]
+            energy = np.geomspace(e_min, e_max, 4)
 
-        if offset is None:
-            off_lo, off_hi = self.data.axis('offset').nodes[[0, -1]].to('deg').value
-            offset = np.linspace(off_lo, off_hi, 100) * u.deg
+        offset_axis = self.axes["offset"]
 
         for ee in energy:
-            area = self.data.evaluate(offset=offset, energy=ee)
+            area = self.evaluate(offset=offset_axis.center, energy_true=ee)
             area /= np.nanmax(area)
             if np.isnan(area).all():
                 continue
-            label = 'energy = {:.1f}'.format(ee)
-            ax.plot(offset, area, label=label, **kwargs)
+            label = f"energy = {ee:.1f}"
+            with quantity_support():
+                ax.plot(offset_axis.center, area, label=label, **kwargs)
 
+        offset_axis.format_plot_xaxis(ax=ax)
         ax.set_ylim(0, 1.1)
-        ax.set_xlabel('Offset ({})'.format(self.data.axis('offset').unit))
-        ax.set_ylabel('Relative Effective Area')
-        ax.legend(loc='best')
-
+        ax.set_ylabel("Relative Effective Area")
+        ax.legend(loc="best")
         return ax
 
     def plot(self, ax=None, add_cbar=True, **kwargs):
         """Plot effective area image."""
-        import matplotlib.pyplot as plt
-
         ax = plt.gca() if ax is None else ax
 
-        offset = self.data.axis('offset').bins
-        energy = self.data.axis('energy').bins
-        aeff = self.data.evaluate(offset=offset, energy=energy)
+        energy = self.axes["energy_true"]
+        offset = self.axes["offset"]
+        aeff = self.evaluate(
+            offset=offset.center, energy_true=energy.center[:, np.newaxis]
+        )
 
         vmin, vmax = np.nanmin(aeff.value), np.nanmax(aeff.value)
 
-        kwargs.setdefault('cmap', 'GnBu')
-        kwargs.setdefault('edgecolors', 'face')
-        kwargs.setdefault('vmin', vmin)
-        kwargs.setdefault('vmax', vmax)
+        kwargs.setdefault("cmap", "GnBu")
+        kwargs.setdefault("edgecolors", "face")
+        kwargs.setdefault("vmin", vmin)
+        kwargs.setdefault("vmax", vmax)
 
-        caxes = ax.pcolormesh(energy.value, offset.value, aeff.value.T, **kwargs)
+        with quantity_support():
+            caxes = ax.pcolormesh(energy.edges, offset.edges, aeff.value.T, **kwargs)
 
-        ax.set_xscale('log')
-        ax.set_ylabel('Offset ({})'.format(offset.unit))
-        ax.set_xlabel('Energy ({})'.format(energy.unit))
-
-        xmin, xmax = energy.value.min(), energy.value.max()
-        ax.set_xlim(xmin, xmax)
+        energy.format_plot_xaxis(ax=ax)
+        offset.format_plot_yaxis(ax=ax)
 
         if add_cbar:
-            label = 'Effective Area ({unit})'.format(unit=aeff.unit)
-            cbar = ax.figure.colorbar(caxes, ax=ax, label=label)
+            label = f"Effective Area [{aeff.unit}]"
+            ax.figure.colorbar(caxes, ax=ax, label=label)
 
         return ax
 
     def peek(self, figsize=(15, 5)):
-        """Quick-look summary plots."""
-        import matplotlib.pyplot as plt
+        """Quick-look summary plots.
+
+        Parameters
+        ----------
+        figsize : tuple
+            Size of the figure.
+
+        """
         fig, axes = plt.subplots(nrows=1, ncols=3, figsize=figsize)
         self.plot(ax=axes[2])
         self.plot_energy_dependence(ax=axes[0])
         self.plot_offset_dependence(ax=axes[1])
         plt.tight_layout()
+
+    @classmethod
+    def from_parametrization(cls, energy_axis_true=None, instrument="HESS"):
+        r"""Create parametrized effective area.
+
+        Parametrizations of the effective areas of different Cherenkov
+        telescopes taken from Appendix B of Abramowski et al. (2010), see
+        https://ui.adsabs.harvard.edu/abs/2010MNRAS.402.1342A .
+
+        .. math::
+            A_{eff}(E) = g_1 \left(\frac{E}{\mathrm{MeV}}\right)^{-g_2}\exp{\left(-\frac{g_3}{E}\right)}
+
+        This method does not model the offset dependence of the effective area,
+        but just assumes that it is constant.
+
+        Parameters
+        ----------
+        energy_axis_true : `MapAxis`
+            Energy binning, analytic function is evaluated at log centers
+        instrument : {'HESS', 'HESS2', 'CTA'}
+            Instrument name
+
+        Returns
+        -------
+        aeff : `EffectiveAreaTable2D`
+            Effective area table
+        """
+        # Put the parameters g in a dictionary.
+        # Units: g1 (cm^2), g2 (), g3 (MeV)
+        pars = {
+            "HESS": [6.85e9, 0.0891, 5e5],
+            "HESS2": [2.05e9, 0.0891, 1e5],
+            "CTA": [1.71e11, 0.0891, 1e5],
+        }
+
+        if instrument not in pars.keys():
+            ss = f"Unknown instrument: {instrument}\n"
+            ss += f"Valid instruments: {list(pars.keys())}"
+            raise ValueError(ss)
+
+        if energy_axis_true is None:
+            energy_axis_true = MapAxis.from_energy_bounds(
+                "2 GeV", "200 TeV", nbin=20, per_decade=True, name="energy_true"
+            )
+
+        g1, g2, g3 = pars[instrument]
+
+        offset_axis = MapAxis.from_edges([0.0, 5.0] * u.deg, name="offset")
+        axes = MapAxes([energy_axis_true, offset_axis])
+        coords = axes.get_coord()
+
+        energy, offset = coords["energy_true"].to_value("MeV"), coords["offset"]
+        data = np.ones_like(offset.value) * g1 * energy ** (-g2) * np.exp(-g3 / energy)
+
+        # TODO: fake offset dependence?
+        meta = {"TELESCOP": instrument}
+        return cls(axes=axes, data=data, unit="cm2", meta=meta)

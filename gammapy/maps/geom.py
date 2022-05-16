@@ -1,135 +1,17 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
 import abc
-import re
+import copy
+import inspect
+import logging
 import numpy as np
-from ..extern import six
-from astropy.utils.misc import InheritDocstrings
-from astropy.io import fits
 from astropy import units as u
-from astropy.coordinates import SkyCoord
-from .utils import find_hdu, find_bands_hdu
+from astropy.io import fits
+from .io import find_bands_hdu, find_hdu
+from .utils import INVALID_INDEX
 
-__all__ = [
-    'MapCoords',
-    'MapGeom',
-    'MapAxis',
-]
+__all__ = ["Geom"]
 
-
-def make_axes(axes_in, conv):
-    """Make a sequence of `~MapAxis` objects."""
-
-    if axes_in is None:
-        return []
-
-    axes_out = []
-    for i, ax in enumerate(axes_in):
-        if isinstance(ax, np.ndarray):
-            ax = MapAxis(ax)
-
-        if conv in ['fgst-ccube', 'fgst-template']:
-            ax.name = 'energy'
-        elif ax.name == '':
-            ax.name = 'axis%i' % i
-
-        axes_out += [ax]
-
-    return axes_out
-
-
-def make_axes_cols(axes, axis_names=None):
-    """Make FITS table columns for map axes.
-
-    Parameters
-    ----------
-    axes : list of `~MapAxis`
-
-    axis_names : list of str
-
-    """
-
-    colname = {
-        'energy': ['ENERGY', 'E_MIN', 'E_MAX'],
-        'time': ['TIME', 'T_MIN', 'T_MAX'],
-    }
-
-    if axis_names is None:
-        axis_names = [ax.name for ax in axes]
-
-    size = np.prod([ax.nbin for ax in axes])
-    chan = np.arange(0, size)
-    cols = [fits.Column('CHANNEL', 'I', array=chan), ]
-    axes_ctr = np.meshgrid(*[ax.center for ax in axes])
-    axes_min = np.meshgrid(*[ax.edges[:-1] for ax in axes])
-    axes_max = np.meshgrid(*[ax.edges[1:] for ax in axes])
-    for i, (ax, name) in enumerate(zip(axes, axis_names)):
-
-        names = colname.get(name.lower(),
-                            ['AXIS%i' % i,
-                             'AXIS%i_MIN' % i, 'AXIS%i_MAX' % i])
-        for t, v in zip(names, [axes_ctr, axes_min, axes_max]):
-            cols += [fits.Column(t, 'E', array=np.ravel(v[i]),
-                                 unit=ax.unit.to_string()), ]
-
-    return cols
-
-
-def find_and_read_bands(hdu, header=None):
-    """Read and returns the map axes from a BANDS table.
-
-    Parameters
-    ----------
-    hdu : `~astropy.io.fits.BinTableHDU`
-        The BANDS table HDU.
-    header : `~astropy.io.fits.Header`
-        TODO
-
-    Returns
-    -------
-    axes : list of `~MapAxis`
-        List of axis objects.
-    """
-    if hdu is None:
-        return []
-
-    axes = []
-    axis_cols = []
-    if hdu.name == 'ENERGIES':
-        axis_cols = [['ENERGY']]
-    elif hdu.name == 'EBOUNDS':
-        axis_cols = [['E_MIN', 'E_MAX']]
-    else:
-        for i in range(5):
-            if 'AXCOLS%i' % i in hdu.header:
-                axis_cols += [hdu.header['AXCOLS%i' % i].split(',')]
-
-    for i, cols in enumerate(axis_cols):
-
-        if 'ENERGY' in cols or 'E_MIN' in cols:
-            name = 'energy'
-        elif re.search('(.+)_MIN', cols[0]):
-            name = re.search('(.+)_MIN', cols[0]).group(1)
-        else:
-            name = cols[0]
-
-        unit = hdu.data.columns[cols[0]].unit
-        if unit is None and header is not None:
-            unit = header.get('CUNIT%i' % (3 + i), '')
-
-        if len(cols) == 2:
-            xmin = np.unique(hdu.data.field(cols[0]))
-            xmax = np.unique(hdu.data.field(cols[1]))
-            axis = MapAxis(np.append(xmin, xmax[-1]), name=name,
-                           unit=unit)
-            axes += [axis]
-        else:
-            x = np.unique(hdu.data.field(cols[0]))
-            axis = MapAxis.from_nodes(x, name=name,
-                                      unit=unit)
-            axes += [axis]
-
-    return axes
+log = logging.getLogger(__name__)
 
 
 def get_shape(param):
@@ -138,531 +20,75 @@ def get_shape(param):
 
     if not isinstance(param, tuple):
         param = [param]
+
     return max([np.array(p, ndmin=1).shape for p in param])
 
 
-def coordsys_to_frame(coordsys):
-    if coordsys in ['CEL', 'C']:
-        return 'icrs'
-    elif coordsys in ['GAL', 'G']:
-        return 'galactic'
-    else:
-        raise ValueError('Unrecognized coordinate system: {}'.format(coordsys))
+def pix_tuple_to_idx(pix):
+    """Convert a tuple of pixel coordinate arrays to a tuple of pixel indices.
 
-
-def skydir_to_lonlat(skydir, coordsys=None):
-    if coordsys in ['CEL', 'C']:
-        skydir = skydir.transform_to('icrs')
-    elif coordsys in ['GAL', 'G']:
-        skydir = skydir.transform_to('galactic')
-
-    if skydir.frame.name in ['icrs', 'fk5']:
-        return skydir.ra.deg, skydir.dec.deg
-    elif skydir.frame.name in ['galactic']:
-        return skydir.l.deg, skydir.b.deg
-    else:
-        raise ValueError(
-            'Unrecognized SkyCoord frame: {}'.format(skydir.frame.name))
-
-
-def pix_tuple_to_idx(pix, copy=False):
-    """Convert a tuple of pixel coordinate arrays to a tuple of pixel
-    indices.  Pixel coordinates are rounded to the closest integer
-    value.
+    Pixel coordinates are rounded to the closest integer value.
 
     Parameters
     ----------
     pix : tuple
-        Tuple of pixel coordinates with one element for each dimension.
-
-    copy : bool
-        Flag to set whether a copy or view is returned.
+        Tuple of pixel coordinates with one element for each dimension
 
     Returns
     -------
     idx : `~numpy.ndarray`
-        Array of pixel indices.
+        Array of pixel indices
     """
     idx = []
-    for i, p in enumerate(pix):
-        p = np.array(p, copy=copy, ndmin=1)
+    for p in pix:
+        p = np.array(p, ndmin=1)
         if np.issubdtype(p.dtype, np.integer):
             idx += [p]
         else:
-            #idx += [np.rint(p).astype(int)]
             p_idx = np.rint(p).astype(int)
-            p_idx[~np.isfinite(p)] = -1
+            p_idx[~np.isfinite(p)] = INVALID_INDEX.int
             idx += [p_idx]
+
     return tuple(idx)
 
 
-def axes_pix_to_coord(axes, pix):
-    """Perform pixel to axis coordinates for a list of `~MapAxis`
-    objects.
+class Geom(abc.ABC):
+    """Map geometry base class.
 
-    Parameters
-    ----------
-    axes : list
-        List of `~MapAxis`.
-
-    pix : tuple
-        Tuple of pixel coordinates.
-    """
-    coords = []
-    for ax, t in zip(axes, pix):
-        coords += [ax.pix_to_coord(t)]
-
-    return coords
-
-
-def coord_to_idx(edges, x, bounded=False):
-    """Convert axis coordinates ``x`` to bin indices.
-
-    Returns -1 for values below/above the lower/upper edge.
-    """
-    x = np.array(x, ndmin=1)
-    ibin = np.digitize(x, edges) - 1
-
-    if bounded:
-        ibin[x < edges[0]] = 0
-        ibin[x > edges[-1]] = len(edges) - 1
-    else:
-        ibin[x > edges[-1]] = -1
-
-    return ibin
-
-
-def bin_to_val(edges, bins):
-    ctr = 0.5 * (edges[1:] + edges[:-1])
-    return ctr[bins]
-
-
-def coord_to_pix(edges, coord, interp='lin'):
-    """Convert axis coordinates to pixel coordinates using the chosen
-    interpolation scheme."""
-    from scipy.interpolate import interp1d
-
-    if interp == 'log':
-        fn = np.log
-    elif interp == 'lin':
-        def fn(t):
-            return t
-    elif interp == 'sqrt':
-        fn = np.sqrt
-    else:
-        raise ValueError('Invalid interp: {}'.format(interp))
-
-    interp_fn = interp1d(
-        fn(edges),
-        np.arange(len(edges)).astype(float),
-        fill_value='extrapolate',
-    )
-
-    return interp_fn(fn(coord))
-
-
-def pix_to_coord(edges, pix, interp='lin'):
-    """Convert pixel coordinates to grid coordinates using the chosen
-    interpolation scheme."""
-    from scipy.interpolate import interp1d
-
-    if interp == 'log':
-        fn0 = np.log
-        fn1 = np.exp
-    elif interp == 'lin':
-        def fn0(t):
-            return t
-
-        def fn1(t):
-            return t
-    elif interp == 'sqrt':
-        fn0 = np.sqrt
-
-        def fn1(t):
-            return np.power(t, 2)
-    else:
-        raise ValueError('Invalid interp: {}'.format(interp))
-
-    interp_fn = interp1d(
-        np.arange(len(edges)).astype(float),
-        fn0(edges),
-        fill_value='extrapolate',
-    )
-
-    return fn1(interp_fn(pix))
-
-
-class MapAxis(object):
-    """Class representing an axis of a map.
-
-    Provides methods for
-    transforming to/from axis and pixel coordinates.  An axis is
-    defined by a sequence of node values that lie at the center of
-    each bin.  The pixel coordinate at each node is equal to its index
-    in the node array (0, 1, ..).  Bin edges are offset by 0.5 in
-    pixel coordinates from the nodes such that the lower/upper edge of
-    the first bin is (-0.5,0.5).
-
-    Parameters
-    ----------
-    nodes : `~numpy.ndarray`
-        Array of node values.  These will be interpreted as either bin
-        edges or centers according to ``node_type``.
-    interp : str
-        Interpolation method used to transform between axis and pixel
-        coordinates.  Valid options are 'log', 'lin', and 'sqrt'.
-    name : str
-        Axis name
-    node_type : str
-        Flag indicating whether coordinate nodes correspond to pixel
-        edges (node_type = 'edge') or pixel centers (node_type =
-        'center').  'center' should be used where the map values are
-        defined at a specific coordinate (e.g. differential
-        quantities). 'edge' should be used where map values are
-        defined by an integral over coordinate intervals (e.g. a
-        counts histogram).
-    unit : str
-        String specifying the data units.
+    See also: `~gammapy.maps.WcsGeom` and `~gammapy.maps.HpxGeom`
     """
 
-    # TODO: Add methods to faciliate FITS I/O.
-    # TODO: Cache an interpolation object?
-
-    def __init__(self, nodes, interp='lin', name='',
-                 node_type='edge', unit=''):
-        self._name = name
-        self._interp = interp
-        self._nodes = nodes
-        self._node_type = node_type
-        self._unit = u.Unit('' if unit is None else unit)
-
-        # Set pixel coordinate of first node
-        if node_type == 'edge':
-            self._pix_offset = -0.5
-            nbin = len(nodes) - 1
-        elif node_type == 'center':
-            self._pix_offset = 0.0
-            nbin = len(nodes)
-        else:
-            raise ValueError('Invalid node type: {}'.format(node_type))
-
-        pix = np.arange(nbin, dtype=float)
-        self._center = self.pix_to_coord(pix)
-        pix = np.arange(nbin + 1, dtype=float) - 0.5
-        self._bin_edges = self.pix_to_coord(pix)
-
-    def __eq__(self, other):
-        if isinstance(other, self.__class__):
-            return (np.allclose(self._nodes, other._nodes) and
-                    self._node_type == other._node_type and
-                    self._interp == other._interp and
-                    self._unit == other._unit)
-        return NotImplemented
-
-    def __ne__(self, other):
-        if isinstance(other, self.__class__):
-            return not self.__eq__(other)
-        return NotImplemented
+    # workaround for the lru_cache pickle issue
+    # see e.g. https://github.com/cloudpipe/cloudpickle/issues/178
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for key, value in state.items():
+            func = getattr(value, "__wrapped__", None)
+            if func is not None:
+                state[key] = func
+        return state
 
     @property
-    def name(self):
-        """Name of the axis."""
-        return self._name
+    @abc.abstractmethod
+    def data_shape(self):
+        """Shape of the Numpy data array matching this geometry."""
+        pass
 
-    @name.setter
-    def name(self, val):
-        self._name = val
-
-    @property
-    def edges(self):
-        """Return array of bin edges."""
-        return self._bin_edges
-
-    @property
-    def center(self):
-        """Return array of bin centers."""
-        return self._center
-
-    @property
-    def nbin(self):
-        """Return number of bins."""
-        return len(self._bin_edges) - 1
-
-    @property
-    def node_type(self):
-        """Return node type ('center' or 'edge')."""
-        return self._node_type
-
-    @property
-    def unit(self):
-        """Return coordinate axis unit."""
-        return self._unit
-
-    @classmethod
-    def from_bounds(cls, lo_bnd, hi_bnd, nbin, **kwargs):
-        """Generate an axis object from a lower/upper bound and number of
-        bins.  If node_type = 'edge' then bounds correspond to the
-        lower and upper bound of the first and last bin.  If node_type
-        = 'center' then bounds correspond to the centers of the first
-        and last bin.
+    def data_nbytes(self, dtype="float32"):
+        """Estimate memory usage in megabytes of the Numpy data array
+        matching this geometry depending on the given type.
 
         Parameters
         ----------
-        lo_bnd : float
-            Lower bound of first axis bin.
-        hi_bnd : float
-            Upper bound of last axis bin.
-        nbin : int
-            Number of bins.
-        interp : {'lin', 'log', 'sqrt'}
-            Interpolation method used to transform between axis and pixel
-            coordinates.  Default: 'lin'.
-        """
-        interp = kwargs.setdefault('interp', 'lin')
-        node_type = kwargs.setdefault('node_type', 'edge')
-
-        if node_type == 'edge':
-            nnode = nbin + 1
-        elif node_type == 'center':
-            nnode = nbin
-        else:
-            raise ValueError('Invalid node type: {}'.format(node_type))
-
-        if interp == 'lin':
-            nodes = np.linspace(lo_bnd, hi_bnd, nnode)
-        elif interp == 'log':
-            nodes = np.exp(np.linspace(np.log(lo_bnd),
-                                       np.log(hi_bnd), nnode))
-        elif interp == 'sqrt':
-            nodes = np.linspace(lo_bnd ** 0.5,
-                                hi_bnd ** 0.5, nnode) ** 2.0
-        else:
-            raise ValueError('Invalid interp: {}'.format(interp))
-
-        return cls(nodes, **kwargs)
-
-    @classmethod
-    def from_nodes(cls, nodes, **kwargs):
-        """Generate an axis object from a sequence of nodes (bin centers).
-
-        This will create a sequence of bins with edges half-way
-        between the node values.  This method should be used to
-        construct an axis where the bin center should lie at a
-        specific value (e.g. a map of a continuous function).
-
-        Parameters
-        ----------
-        nodes : `~numpy.ndarray`
-            Axis nodes (bin center).
-        interp : {'lin', 'log', 'sqrt'}
-            Interpolation method used to transform between axis and pixel
-            coordinates.  Default: 'lin'.
-        """
-        nodes = np.array(nodes, ndmin=1)
-        if len(nodes) < 1:
-            raise ValueError('Nodes array must have at least one element.')
-
-        return cls(nodes, node_type='center', **kwargs)
-
-    @classmethod
-    def from_edges(cls, edges, **kwargs):
-        """Generate an axis object from a sequence of bin edges.
-
-        This method should be used to construct an axis where the bin
-        edges should lie at specific values (e.g. a histogram).  The
-        number of bins will be one less than the number of edges.
-
-        Parameters
-        ----------
-        edges : `~numpy.ndarray`
-            Axis bin edges.
-        interp : {'lin', 'log', 'sqrt'}
-            Interpolation method used to transform between axis and pixel
-            coordinates.  Default: 'lin'.
-        """
-        if len(edges) < 2:
-            raise ValueError('Edges array must have at least two elements.')
-
-        return cls(edges, node_type='edge', **kwargs)
-
-    def pix_to_coord(self, pix):
-        """Transform from pixel to axis coordinates.
-
-        Parameters
-        ----------
-        pix : `~numpy.ndarray`
-            Array of pixel coordinate values.
+        dtype : data-type
+            The desired data-type for the array. Default is "float32"
 
         Returns
         -------
-        coord : `~numpy.ndarray`
-            Array of axis coordinate values.
+        memory : `~astropy.units.Quantity`
+            Estimated memory usage in megabytes (MB)
         """
-        pix = pix - self._pix_offset
-        return pix_to_coord(self._nodes, pix, interp=self._interp)
-
-    def coord_to_pix(self, coord):
-        """Transform from axis to pixel coordinates.
-
-        Parameters
-        ----------
-        coord : `~numpy.ndarray`
-            Array of axis coordinate values.
-
-        Returns
-        -------
-        pix : `~numpy.ndarray`
-            Array of pixel coordinate values.
-        """
-        pix = coord_to_pix(self._nodes, coord, interp=self._interp)
-        return np.array(pix + self._pix_offset, ndmin=1)
-
-    def coord_to_idx(self, coord, bounded=False):
-        """Transform from axis coordinate to bin index.
-
-        Parameters
-        ----------
-        coord : `~numpy.ndarray`
-            Array of axis coordinate values.
-        bounded : bool
-            Choose whether to clip the index to the valid range of the
-            axis.  If false then indices for values outside the axis
-            range will be set -1.
-
-        Returns
-        -------
-        idx : `~numpy.ndarray`
-            Array of bin indices.
-        """
-        return coord_to_idx(self.edges, coord, bounded)
-
-    def coord_to_idx_interp(self, coord):
-        """Compute indices of two nearest bins to the given coordinate.
-
-        Parameters
-        ----------
-        coord : `~numpy.ndarray`
-            Array of axis coordinate values.
-        """
-
-        return (coord_to_idx(self.center[:-1], coord, bounded=True),
-                coord_to_idx(self.center[:-1], coord, bounded=True) + 1,)
-
-    def slice(self, idx):
-        """Create a new axis object by extracting a slice from this axis.
-
-        Parameters
-        ----------
-        idx : slice
-            Slice object selecting a subselection of the axis.
-
-        Returns
-        -------
-        axis : `~MapAxis`
-            Sliced axis objected.
-        """
-        center = self.center[idx]
-        idx = self.coord_to_idx(center)
-        # For edge nodes we need to keep N+1 nodes
-        if self._node_type == 'edge':
-            idx = tuple(list(idx) + [1 + idx[-1]])
-        nodes = self._nodes[(idx,)]
-        return MapAxis(nodes, interp=self._interp, name=self._name,
-                       node_type=self._node_type, unit=self._unit)
-
-
-class MapCoords(object):
-    """Represents a sequence of n-dimensional map coordinates.
-
-    Contains coordinates for 2 spatial dimensions and an arbitrary
-    number of additional non-spatial dimensions.
-
-    Parameters
-    ----------
-    data : tuple of `~numpy.ndarray`
-        Tuple of coordinate values.  
-    """
-
-    def __init__(self, data, coordsys='CEL'):
-        data = tuple([np.array(c, ndmin=1, copy=False) for c in data])
-        self._data = np.broadcast_arrays(*data)
-        self._coordsys = coordsys
-
-    def __getitem__(self, idx):
-        return self._data[idx]
-
-    def __iter__(self):
-        return iter(self._data)
-
-    @property
-    def ndim(self):
-        return len(self._data)
-
-    @property
-    def shape(self):
-        return self._data[0].shape
-
-    @property
-    def size(self):
-        return self._data[0].size
-
-    @property
-    def lon(self):
-        return self._data[0]
-
-    @property
-    def lat(self):
-        return self._data[1]
-
-    @classmethod
-    def from_lonlat(cls, lon, lat, *args, **kwargs):
-        """Create from vectors of longitude and latitude in degrees."""
-        return cls(tuple([lon, lat] + list(args)), **kwargs)
-
-    @classmethod
-    def from_skydir(cls, skydir, *args, **kwargs):
-        """Create from vector of `~astropy.coordinates.SkyCoord`."""
-        if skydir.frame.name in ['icrs', 'fk5']:
-            return cls.from_lonlat(skydir.ra.deg, skydir.dec.deg, *args,
-                                   coordsys='CEL')
-        elif skydir.frame.name in ['galactic']:
-            return cls.from_lonlat(skydir.l.deg, skydir.b.deg, *args,
-                                   coordsys='GAL')
-        else:
-            raise Exception(
-                'Unrecognized coordinate frame: {}'.format(skydir.frame.name))
-
-    @classmethod
-    def from_tuple(cls, coords, **kwargs):
-        """Create from tuple of coordinate vectors."""
-        if (isinstance(coords[0], np.ndarray) or
-                isinstance(coords[0], list) or
-                np.isscalar(coords[0])):
-            return cls.from_lonlat(*coords, **kwargs)
-        elif isinstance(coords[0], SkyCoord):
-            return cls.from_skydir(*coords, **kwargs)
-        else:
-            raise Exception('Unsupported input type.')
-
-    @classmethod
-    def create(cls, data, **kwargs):
-        if isinstance(data, cls):
-            return data
-        elif isinstance(data, tuple) or isinstance(data, list):
-            return cls.from_tuple(data, **kwargs)
-        elif isinstance(data, SkyCoord):
-            return cls.from_skydir(data, **kwargs)
-        else:
-            raise Exception('Unsupported input type.')
-
-
-class MapGeomMeta(InheritDocstrings, abc.ABCMeta):
-    pass
-
-
-@six.add_metaclass(MapGeomMeta)
-class MapGeom(object):
-    """Base class for WCS and HEALPix geometries."""
+        return (np.empty(self.data_shape, dtype).nbytes * u.byte).to("MB")
 
     @property
     @abc.abstractmethod
@@ -685,30 +111,6 @@ class MapGeom(object):
         pass
 
     @classmethod
-    def read(cls, filename, **kwargs):
-        """Create a geometry object from a FITS file.
-
-        Parameters
-        ----------
-        filename : str
-            Name of the FITS file.
-        hdu : str
-            Name or index of the HDU with the map data.
-        hdu_bands : str
-            Name or index of the HDU with the BANDS table.  If not
-            defined this will be inferred from the FITS header of the
-            map HDU.
-
-        Returns
-        -------
-        geom : `~MapGeom`
-            Geometry object.
-        """
-        with fits.open(filename) as hdulist:
-            geom = cls.from_hdulist(hdulist, **kwargs)
-        return geom
-
-    @classmethod
     def from_hdulist(cls, hdulist, hdu=None, hdu_bands=None):
         """Load a geometry object from a FITS HDUList.
 
@@ -725,7 +127,7 @@ class MapGeom(object):
 
         Returns
         -------
-        geom : `~MapGeom`
+        geom : `~Geom`
             Geometry object.
         """
         if hdu is None:
@@ -741,8 +143,16 @@ class MapGeom(object):
 
         return cls.from_header(hdu.header, hdu_bands)
 
+    def to_bands_hdu(self, hdu_bands=None, format="gadf"):
+        table_hdu = self.axes.to_table_hdu(format=format, hdu_bands=hdu_bands)
+        cols = table_hdu.columns.columns
+        cols.extend(self._make_bands_cols())
+        return fits.BinTableHDU.from_columns(
+            cols, header=table_hdu.header, name=table_hdu.name
+        )
+
     @abc.abstractmethod
-    def make_bands_hdu(self):
+    def _make_bands_cols(self):
         pass
 
     @abc.abstractmethod
@@ -760,12 +170,10 @@ class MapGeom(object):
             dimension.  If defined only pixels for the image plane with
             this index will be returned.  If none then all pixels
             will be returned.
-
         local : bool
             Flag to return local or global pixel indices.  Local
             indices run from 0 to the number of pixels in a given
             image plane.
-
         flat : bool, optional
             Return a flattened array containing only indices for
             pixels contained in the geometry.
@@ -779,7 +187,7 @@ class MapGeom(object):
         pass
 
     @abc.abstractmethod
-    def get_coords(self, idx=None, flat=False):
+    def get_coord(self, idx=None, flat=False):
         """Get the coordinate array for this geometry.
 
         Returns a coordinate array with the same shape as the data
@@ -794,7 +202,6 @@ class MapGeom(object):
             dimension.  If defined only coordinates for the image
             plane with this index will be returned.  If none then
             coordinates for all pixels will be returned.
-
         flat : bool, optional
             Return a flattened array containing only coordinates for
             pixels contained in the geometry.
@@ -804,7 +211,6 @@ class MapGeom(object):
         coords : tuple
             Tuple of coordinate vectors with one vector for each
             dimension.
-
         """
         pass
 
@@ -816,7 +222,7 @@ class MapGeom(object):
         ----------
         coords : tuple
             Coordinate values in each dimension of the map.  This can
-            either be a tuple of numpy arrays or a MapCoords object.
+            either be a tuple of numpy arrays or a MapCoord object.
             If passed as a tuple then the ordering should be
             (longitude, latitude, c_0, ..., c_N) where c_i is the
             coordinate vector for axis i.
@@ -828,17 +234,21 @@ class MapGeom(object):
         """
         pass
 
-    def coord_to_idx(self, coords):
+    def coord_to_idx(self, coords, clip=False):
         """Convert map coordinates to pixel indices.
 
         Parameters
         ----------
-        coords : tuple
+        coords : tuple or `~MapCoord`
             Coordinate values in each dimension of the map.  This can
-            either be a tuple of numpy arrays or a MapCoords object.
+            either be a tuple of numpy arrays or a MapCoord object.
             If passed as a tuple then the ordering should be
             (longitude, latitude, c_0, ..., c_N) where c_i is the
             coordinate vector for axis i.
+        clip : bool
+            Choose whether to clip indices to the valid range of the
+            geometry.  If false then indices for coordinates outside
+            the geometry range will be set -1.
 
         Returns
         -------
@@ -848,7 +258,7 @@ class MapGeom(object):
             map.
         """
         pix = self.coord_to_pix(coords)
-        return self.pix_to_idx(pix)
+        return self.pix_to_idx(pix, clip=clip)
 
     @abc.abstractmethod
     def pix_to_coord(self, pix):
@@ -867,14 +277,19 @@ class MapGeom(object):
         pass
 
     @abc.abstractmethod
-    def pix_to_idx(self, pix):
-        """Convert pixel coordinates to pixel indices.  Returns -1 for pixel
-        coordinates that lie outside of the map.
+    def pix_to_idx(self, pix, clip=False):
+        """Convert pixel coordinates to pixel indices.
+
+        Returns -1 for pixel coordinates that lie outside of the map.
 
         Parameters
         ----------
         pix : tuple
             Tuple of pixel coordinates.
+        clip : bool
+            Choose whether to clip indices to the valid range of the
+            geometry.  If false then indices for coordinates outside
+            the geometry range will be set -1.
 
         Returns
         -------
@@ -889,12 +304,12 @@ class MapGeom(object):
 
         Parameters
         ----------
-        coords : tuple or `~gammapy.maps.MapCoords`
+        coords : tuple or `~gammapy.maps.MapCoord`
             Tuple of map coordinates.
 
         Returns
         -------
-        containment : `~np.ndarray`
+        containment : `~numpy.ndarray`
             Bool array.
         """
         pass
@@ -904,55 +319,63 @@ class MapGeom(object):
 
         Parameters
         ----------
-        coords : tuple
+        pix : tuple
             Tuple of pixel coordinates.
 
         Returns
         -------
-        containment : `~np.ndarray`
+        containment : `~numpy.ndarray`
             Bool array.
         """
         idx = self.pix_to_idx(pix)
-        return np.all(np.stack([t != -1 for t in idx]), axis=0)
+        return np.all(np.stack([t != INVALID_INDEX.int for t in idx]), axis=0)
 
-    @abc.abstractmethod
-    def to_slice(self, slices, drop_axes=True):
-        """Create a new geometry by cutting in the non-spatial dimensions of
-        this geometry.
+    def slice_by_idx(self, slices):
+        """Create a new geometry by slicing the non-spatial axes.
 
         Parameters
         ----------
-        slices : tuple
-            Tuple of integers or `slice` objects.  Contains one
-            element for each non-spatial dimension.
-
-        drop_axes : bool
-            Drop axes for which the slice reduces the size of that
-            dimension to one.
+        slices : dict
+            Dict of axes names and integers or `slice` object pairs. Contains one
+            element for each non-spatial dimension. For integer indexing the
+            corresponding axes is dropped from the map. Axes not specified in the
+            dict are kept unchanged.
 
         Returns
         -------
-        geom : `~MapGeom`
+        geom : `~Geom`
             Sliced geometry.
         """
-        pass
+        axes = self.axes.slice_by_idx(slices)
+        return self._init_copy(axes=axes)
+
+    @property
+    def as_energy_true(self):
+        """If the geom contains an energy axis rename it to energy true"""
+        energy_axis = self.axes["energy"].copy(name="energy_true")
+        return self.to_image().to_cube([energy_axis])
+
+    @property
+    def has_energy_axis(self):
+        """Whether geom has an energy axis"""
+        return ("energy" in self.axes.names) ^ ("energy_true" in self.axes.names)
 
     @abc.abstractmethod
     def to_image(self):
-        """Create a 2D geometry by dropping all non-spatial dimensions of this
-        geometry.
+        """Create 2D image geometry (drop non-spatial dimensions).
 
         Returns
         -------
-        geom : `~MapGeom`
+        geom : `~Geom`
             Image geometry.
         """
         pass
 
     @abc.abstractmethod
     def to_cube(self, axes):
-        """Create a new geometry by appending a list of non-spatial axes to
-        the present geometry.  This will result in a new geometry with
+        """Append non-spatial axes to create a higher-dimensional geometry.
+
+        This will result in a new geometry with
         N+M dimensions where N is the number of current dimensions and
         M is the number of axes in the list.
 
@@ -963,24 +386,238 @@ class MapGeom(object):
 
         Returns
         -------
-        geom : `~MapGeom`
+        geom : `~Geom`
             Map geometry.
         """
         pass
 
-    def _fill_header_from_axes(self, header):
+    def squash(self, axis_name):
+        """Squash geom axis.
 
-        for i, ax in enumerate(self.axes):
+        Parameters
+        ----------
+        axis_name : str
+            Axis to squash.
 
-            if ax.name == 'energy' and ax.node_type == 'edge':
-                header['AXCOLS%i' % (i + 1)] = 'E_MIN,E_MAX'
-            elif ax.name == 'energy' and ax.node_type == 'center':
-                header['AXCOLS%i' % (i + 1)] = 'ENERGY'
-            elif ax.node_type == 'edge':
-                header['AXCOLS%i' % (i + 1)] = '{}_MIN,{}_MAX'.format(ax.name.upper(),
-                                                                      ax.name.upper())
-            elif ax.node_type == 'center':
-                header['AXCOLS%i' % (i + 1)] = ax.name.upper()
-            else:
-                raise ValueError('Invalid node type '
-                                 '{}'.format(ax.node_type))
+        Returns
+        -------
+        geom : `Geom`
+            Geom with squashed axis.
+        """
+        axes = self.axes.squash(axis_name=axis_name)
+        return self.to_image().to_cube(axes=axes)
+
+    def drop(self, axis_name):
+        """Drop an axis from the geom.
+
+        Parameters
+        ----------
+        axis_name : str
+            Name of the axis to remove.
+
+        Returns
+            -------
+        geom : `Geom`
+            New geom with the axis removed.
+        """
+        axes = self.axes.drop(axis_name=axis_name)
+        return self.to_image().to_cube(axes=axes)
+
+    def pad(self, pad_width, axis_name):
+        """
+        Pad the geometry at the edges.
+
+        Parameters
+        ----------
+        pad_width : {sequence, array_like, int}
+            Number of values padded to the edges of each axis.
+        axis_name : str
+            Name of the axis to pad.
+
+        Returns
+        -------
+        geom : `~Geom`
+            Padded geometry.
+        """
+        if axis_name is None:
+            return self._pad_spatial(pad_width)
+        else:
+            axes = self.axes.pad(axis_name=axis_name, pad_width=pad_width)
+            return self.to_image().to_cube(axes)
+
+    @abc.abstractmethod
+    def _pad_spatial(self, pad_width):
+        pass
+
+    @abc.abstractmethod
+    def crop(self, crop_width):
+        """
+        Crop the geometry at the edges.
+
+        Parameters
+        ----------
+        crop_width : {sequence, array_like, int}
+            Number of values cropped from the edges of each axis.
+
+        Returns
+        -------
+        geom : `~Geom`
+            Cropped geometry.
+        """
+        pass
+
+    @abc.abstractmethod
+    def downsample(self, factor, axis_name):
+        """Downsample the spatial dimension of the geometry by a given factor.
+
+        Parameters
+        ----------
+        factor : int
+            Downsampling factor.
+        axis_name : str
+            Axis to downsample.
+
+        Returns
+        -------
+        geom : `~Geom`
+            Downsampled geometry.
+
+        """
+        pass
+
+    @abc.abstractmethod
+    def upsample(self, factor, axis_name=None):
+        """Upsample the spatial dimension of the geometry by a given factor.
+
+        Parameters
+        ----------
+        factor : int
+            Upsampling factor.
+        axis_name : str
+            Axis to upsample.
+
+        Returns
+        -------
+        geom : `~Geom`
+            Upsampled geometry.
+
+        """
+        pass
+
+    def resample_axis(self, axis):
+        """Resample geom to a new axis binning.
+
+        This method groups the existing bins into a new binning.
+
+        Parameters
+        ----------
+        axis : `MapAxis`
+            New map axis.
+
+        Returns
+        -------
+        map : `Geom`
+            Geom with resampled axis.
+        """
+        axes = self.axes.resample(axis=axis)
+        return self._init_copy(axes=axes)
+
+    def replace_axis(self, axis):
+        """Replace axis with a new one.
+
+        Parameters
+        ----------
+        axis : `MapAxis`
+            New map axis.
+
+        Returns
+        -------
+        map : `Geom`
+            Geom with replaced axis.
+        """
+        axes = self.axes.replace(axis=axis)
+        return self._init_copy(axes=axes)
+
+    @abc.abstractmethod
+    def solid_angle(self):
+        """Solid angle (`~astropy.units.Quantity` in ``sr``)."""
+        pass
+
+    @property
+    def is_image(self):
+        """Whether the geom is an image without extra dimensions."""
+        if self.axes is None:
+            return True
+        return len(self.axes) == 0
+
+    @property
+    def is_flat(self):
+        """Whether the geom non spatial axes have length 1, i.e. if the geom is equivalent to an image."""
+        if self.is_image:
+            return True
+        else:
+            valid = True
+            for axis in self.axes:
+                valid = valid and (axis.nbin == 1)
+            return valid
+
+    def _init_copy(self, **kwargs):
+        """Init map geom instance by copying missing init arguments from self."""
+        argnames = inspect.getfullargspec(self.__init__).args
+        argnames.remove("self")
+
+        for arg in argnames:
+            value = getattr(self, "_" + arg)
+            kwargs.setdefault(arg, copy.deepcopy(value))
+
+        return self.__class__(**kwargs)
+
+    def copy(self, **kwargs):
+        """Copy and overwrite given attributes.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Keyword arguments to overwrite in the map geometry constructor.
+
+        Returns
+        -------
+        copy : `Geom`
+            Copied map geometry.
+        """
+        return self._init_copy(**kwargs)
+
+    def energy_mask(self, energy_min=None, energy_max=None, round_to_edge=False):
+        """Create a mask for a given energy range.
+
+        The energy bin must be fully contained to be included in the mask.
+
+        Parameters
+        ----------
+        energy_min, energy_max : `~astropy.units.Quantity`
+            Energy range
+
+        Returns
+        -------
+        mask : `~numpy.ndarray`
+            Energy mask
+        """
+        from . import Map
+
+        # get energy axes and values
+        energy_axis = self.axes["energy"]
+
+        if round_to_edge:
+            energy_min, energy_max = energy_axis.round([energy_min, energy_max])
+
+        # TODO: make this more general
+        shape = (-1, 1) if self.is_hpx else (-1, 1, 1)
+        energy_edges = energy_axis.edges.reshape(shape)
+
+        # set default values
+        energy_min = energy_min if energy_min is not None else energy_edges[0]
+        energy_max = energy_max if energy_max is not None else energy_edges[-1]
+
+        mask = (energy_edges[:-1] >= energy_min) & (energy_edges[1:] <= energy_max)
+        data = np.broadcast_to(mask, shape=self.data_shape)
+        return Map.from_geom(geom=self, data=data, dtype=data.dtype)

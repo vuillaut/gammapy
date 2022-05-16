@@ -1,39 +1,35 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-"""Fermi catalog and source classes.
-"""
-from __future__ import absolute_import, division, print_function, unicode_literals
+"""Fermi catalog and source classes."""
+import abc
+import warnings
 import numpy as np
 import astropy.units as u
-from astropy.table import QTable, Table
-from astropy.time import Time
-from astropy.tests.helper import ignore_warnings
-from astropy.modeling.models import Gaussian2D, Disk2D
-from astropy.coordinates import Angle
-from ..utils.scripts import make_path
-from ..utils.energy import EnergyBounds
-from ..utils.table import table_standardise_units_inplace
-from ..image import SkyImage
-from ..image.models import Delta2D, Template2D
-from ..spectrum import FluxPoints
-from ..spectrum.models import (
-    PowerLaw,
-    PowerLaw2,
-    ExponentialCutoffPowerLaw3FGL,
-    PLSuperExpCutoff3FGL,
-    LogParabola,
+from astropy.table import Table
+from astropy.wcs import FITSFixedWarning
+from gammapy.estimators import FluxPoints
+from gammapy.maps import MapAxis, Maps, RegionGeom
+from gammapy.modeling.models import (
+    DiskSpatialModel,
+    GaussianSpatialModel,
+    Model,
+    PointSpatialModel,
+    SkyModel,
+    TemplateSpatialModel,
 )
-from ..time import LightCurve
-from .core import SourceCatalog, SourceCatalogObject
+from gammapy.utils.gauss import Gauss2DPDF
+from gammapy.utils.scripts import make_path
+from gammapy.utils.table import table_standardise_units_inplace
+from .core import SourceCatalog, SourceCatalogObject, format_flux_points_table
 
 __all__ = [
-    'SourceCatalogObject3FGL',
-    'SourceCatalogObject1FHL',
-    'SourceCatalogObject2FHL',
-    'SourceCatalogObject3FHL',
-    'SourceCatalog3FGL',
-    'SourceCatalog1FHL',
-    'SourceCatalog2FHL',
-    'SourceCatalog3FHL',
+    "SourceCatalog2FHL",
+    "SourceCatalog3FGL",
+    "SourceCatalog3FHL",
+    "SourceCatalog4FGL",
+    "SourceCatalogObject2FHL",
+    "SourceCatalogObject3FGL",
+    "SourceCatalogObject3FHL",
+    "SourceCatalogObject4FGL",
 ]
 
 
@@ -45,1120 +41,1338 @@ def compute_flux_points_ul(quantity, quantity_errp):
     return 2 * quantity_errp + quantity
 
 
-class SourceCatalogObject3FGL(SourceCatalogObject):
+class SourceCatalogObjectFermiBase(SourceCatalogObject, abc.ABC):
+    """Base class for Fermi-LAT catalogs."""
+
+    asso = ["ASSOC1", "ASSOC2", "ASSOC_TEV", "ASSOC_GAM1", "ASSOC_GAM2", "ASSOC_GAM3"]
+    flux_points_meta = {
+        "sed_type_init": "flux",
+        "n_sigma": 1,
+        "sqrt_ts_threshold_ul": 1,
+        "n_sigma_ul": 2,
+    }
+
+    def __str__(self):
+        return self.info()
+
+    def info(self, info="all"):
+        """Summary info string.
+
+        Parameters
+        ----------
+        info : {'all', 'basic', 'more', 'position', 'spectral','lightcurve'}
+            Comma separated list of options
+        """
+        if info == "all":
+            info = "basic,more,position,spectral,lightcurve"
+
+        ss = ""
+        ops = info.split(",")
+        if "basic" in ops:
+            ss += self._info_basic()
+        if "more" in ops:
+            ss += self._info_more()
+        if "position" in ops:
+            ss += self._info_position()
+            if not self.is_pointlike:
+                ss += self._info_morphology()
+        if "spectral" in ops:
+            ss += self._info_spectral_fit()
+            ss += self._info_spectral_points()
+        if "lightcurve" in ops:
+            ss += self._info_lightcurve()
+        return ss
+
+    def _info_basic(self):
+        d = self.data
+        keys = self.asso
+        ss = "\n*** Basic info ***\n\n"
+        ss += "Catalog row index (zero-based) : {}\n".format(self.row_index)
+        ss += "{:<20s} : {}\n".format("Source name", self.name)
+        if "Extended_Source_Name" in d:
+            ss += "{:<20s} : {}\n".format("Extended name", d["Extended_Source_Name"])
+
+        def get_nonentry_keys(keys):
+            vals = [str(d[_]).strip() for _ in keys]
+            return ", ".join([_ for _ in vals if _ != ""])
+
+        associations = get_nonentry_keys(keys)
+        ss += "{:<16s} : {}\n".format("Associations", associations)
+        try:
+            ss += "{:<16s} : {:.3f}\n".format("ASSOC_PROB_BAY", d["ASSOC_PROB_BAY"])
+            ss += "{:<16s} : {:.3f}\n".format("ASSOC_PROB_LR", d["ASSOC_PROB_LR"])
+        except (KeyError):
+            pass
+        try:
+            ss += "{:<16s} : {}\n".format("Class1", d["CLASS1"])
+        except (KeyError):
+            ss += "{:<16s} : {}\n".format("Class", d["CLASS"])
+        try:
+            ss += "{:<16s} : {}\n".format("Class2", d["CLASS2"])
+        except (KeyError):
+            pass
+        ss += "{:<16s} : {}\n".format("TeVCat flag", d.get("TEVCAT_FLAG", "N/A"))
+        return ss
+
+    @abc.abstractmethod
+    def _info_more(self):
+        pass
+
+    def _info_position(self):
+        d = self.data
+        ss = "\n*** Position info ***\n\n"
+        ss += "{:<20s} : {:.3f}\n".format("RA", d["RAJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("DEC", d["DEJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("GLON", d["GLON"])
+        ss += "{:<20s} : {:.3f}\n".format("GLAT", d["GLAT"])
+
+        ss += "\n"
+        ss += "{:<20s} : {:.4f}\n".format("Semimajor (68%)", d["Conf_68_SemiMajor"])
+        ss += "{:<20s} : {:.4f}\n".format("Semiminor (68%)", d["Conf_68_SemiMinor"])
+        ss += "{:<20s} : {:.2f}\n".format("Position angle (68%)", d["Conf_68_PosAng"])
+        ss += "{:<20s} : {:.4f}\n".format("Semimajor (95%)", d["Conf_95_SemiMajor"])
+        ss += "{:<20s} : {:.4f}\n".format("Semiminor (95%)", d["Conf_95_SemiMinor"])
+        ss += "{:<20s} : {:.2f}\n".format("Position angle (95%)", d["Conf_95_PosAng"])
+        ss += "{:<20s} : {:.0f}\n".format("ROI number", d["ROI_num"])
+        return ss
+
+    def _info_morphology(self):
+        e = self.data_extended
+        ss = "\n*** Extended source information ***\n\n"
+        ss += "{:<16s} : {}\n".format("Model form", e["Model_Form"])
+        ss += "{:<16s} : {:.4f}\n".format("Model semimajor", e["Model_SemiMajor"])
+        ss += "{:<16s} : {:.4f}\n".format("Model semiminor", e["Model_SemiMinor"])
+        ss += "{:<16s} : {:.4f}\n".format("Position angle", e["Model_PosAng"])
+        try:
+            ss += "{:<16s} : {}\n".format("Spatial function", e["Spatial_Function"])
+        except KeyError:
+            pass
+        ss += "{:<16s} : {}\n\n".format("Spatial filename", e["Spatial_Filename"])
+        return ss
+
+    def _info_spectral_fit(self):
+        return "\n"
+
+    def _info_spectral_points(self):
+        ss = "\n*** Spectral points ***\n\n"
+        lines = format_flux_points_table(self.flux_points_table).pformat(
+            max_width=-1, max_lines=-1
+        )
+        ss += "\n".join(lines)
+        return ss
+
+    def _info_lightcurve(self):
+        return "\n"
+
+    @property
+    def is_pointlike(self):
+        return self.data["Extended_Source_Name"].strip() == ""
+
+    # FIXME: this should be renamed `set_position_error`,
+    # and `phi_0` isn't filled correctly, other parameters missing
+    # see https://github.com/gammapy/gammapy/pull/2533#issuecomment-553329049
+    def _set_spatial_errors(self, model):
+        d = self.data
+
+        if "Pos_err_68" in d:
+            percent = 0.68
+            semi_minor = d["Pos_err_68"]
+            semi_major = d["Pos_err_68"]
+            phi_0 = 0.0
+        else:
+            percent = 0.95
+            semi_minor = d["Conf_95_SemiMinor"]
+            semi_major = d["Conf_95_SemiMajor"]
+            phi_0 = d["Conf_95_PosAng"]
+
+        if np.isnan(phi_0):
+            phi_0 = 0.0 * u.deg
+
+        scale_1sigma = Gauss2DPDF().containment_radius(percent)
+        lat_err = semi_major / scale_1sigma
+        lon_err = semi_minor / scale_1sigma / np.cos(d["DEJ2000"])
+
+        if "TemplateSpatialModel" not in model.tag:
+            model.parameters["lon_0"].error = lon_err
+            model.parameters["lat_0"].error = lat_err
+            model.phi_0 = phi_0
+
+    def sky_model(self, name=None):
+        """Sky model (`~gammapy.modeling.models.SkyModel`)."""
+        if name is None:
+            name = self.name
+
+        return SkyModel(
+            spatial_model=self.spatial_model(),
+            spectral_model=self.spectral_model(),
+            name=name,
+        )
+
+    @property
+    def flux_points(self):
+        """Flux points (`~gammapy.estimators.FluxPoints`)."""
+
+        return FluxPoints.from_table(
+            table=self.flux_points_table,
+            reference_model=self.sky_model(),
+            format="gadf-sed",
+        )
+
+
+class SourceCatalogObject4FGL(SourceCatalogObjectFermiBase):
+    """One source from the Fermi-LAT 4FGL catalog.
+
+    Catalog is represented by `~gammapy.catalog.SourceCatalog4FGL`.
+    """
+
+    asso = [
+        "ASSOC1",
+        "ASSOC2",
+        "ASSOC_TEV",
+        "ASSOC_FGL",
+        "ASSOC_FHL",
+        "ASSOC_GAM1",
+        "ASSOC_GAM2",
+        "ASSOC_GAM3",
+    ]
+
+    def _info_more(self):
+        d = self.data
+        ss = "\n*** Other info ***\n\n"
+        fmt = "{:<32s} : {:.3f}\n"
+        ss += fmt.format("Significance (100 MeV - 1 TeV)", d["Signif_Avg"])
+        ss += "{:<32s} : {:.1f}\n".format("Npred", d["Npred"])
+        ss += "\n{:<20s} : {}\n".format("Other flags", d["Flags"])
+        return ss
+
+    def _info_spectral_fit(self):
+        d = self.data
+        spec_type = d["SpectrumType"].strip()
+
+        ss = "\n*** Spectral info ***\n\n"
+
+        ss += "{:<45s} : {}\n".format("Spectrum type", d["SpectrumType"])
+        fmt = "{:<45s} : {:.3f}\n"
+        ss += fmt.format("Detection significance (100 MeV - 1 TeV)", d["Signif_Avg"])
+
+        if spec_type == "PowerLaw":
+            tag = "PL"
+        elif spec_type == "LogParabola":
+            tag = "LP"
+            ss += "{:<45s} : {:.4f} +- {:.5f}\n".format(
+                "beta", d["LP_beta"], d["Unc_LP_beta"]
+            )
+            ss += "{:<45s} : {:.1f}\n".format("Significance curvature", d["LP_SigCurv"])
+
+        elif spec_type == "PLSuperExpCutoff":
+            tag = "PLEC"
+            fmt = "{:<45s} : {:.4f} +- {:.4f}\n"
+            if "PLEC_ExpfactorS" in d:
+                ss += fmt.format(
+                    "Exponential factor", d["PLEC_ExpfactorS"], d["Unc_PLEC_ExpfactorS"]
+                )
+            else:
+                ss += fmt.format(
+                    "Exponential factor", d["PLEC_Expfactor"], d["Unc_PLEC_Expfactor"]
+                )
+            ss += "{:<45s} : {:.4f} +- {:.4f}\n".format(
+                "Super-exponential cutoff index",
+                d["PLEC_Exp_Index"],
+                d["Unc_PLEC_Exp_Index"],
+            )
+            ss += "{:<45s} : {:.1f}\n".format(
+                "Significance curvature", d["PLEC_SigCurv"]
+            )
+
+        else:
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
+
+        ss += "{:<45s} : {:.0f} {}\n".format(
+            "Pivot energy", d["Pivot_Energy"].value, d["Pivot_Energy"].unit
+        )
+
+        fmt = "{:<45s} : {:.3f} +- {:.3f}\n"
+        ss += fmt.format(
+            "Spectral index", d[tag + "_Index"], d["Unc_" + tag + "_Index"]
+        )
+
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Flux Density at pivot energy",
+            d[tag + "_Flux_Density"].value,
+            d["Unc_" + tag + "_Flux_Density"].value,
+            "cm-2 MeV-1 s-1",
+        )
+
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Integral flux (1 - 100 GeV)",
+            d["Flux1000"].value,
+            d["Unc_Flux1000"].value,
+            "cm-2 s-1",
+        )
+
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Energy flux (100 MeV - 100 GeV)",
+            d["Energy_Flux100"].value,
+            d["Unc_Energy_Flux100"].value,
+            "erg cm-2 s-1",
+        )
+
+        return ss
+
+    def _info_lightcurve(self):
+        d = self.data
+        ss = "\n*** Lightcurve info ***\n\n"
+        ss += "Lightcurve measured in the energy band: 100 MeV - 100 GeV\n\n"
+
+        ss += "{:<15s} : {:.3f}\n".format("Variability index", d["Variability_Index"])
+
+        if np.isfinite(d["Flux_Peak"]):
+            ss += "{:<40s} : {:.3f}\n".format(
+                "Significance peak (100 MeV - 100 GeV)", d["Signif_Peak"]
+            )
+
+            fmt = "{:<40s} : {:.3} +- {:.3} cm^-2 s^-1\n"
+            ss += fmt.format(
+                "Integral flux peak (100 MeV - 100 GeV)",
+                d["Flux_Peak"].value,
+                d["Unc_Flux_Peak"].value,
+            )
+
+            # TODO: give time as UTC string, not MET
+            ss += "{:<40s} : {:.3} s (Mission elapsed time)\n".format(
+                "Time peak", d["Time_Peak"].value
+            )
+            peak_interval = d["Peak_Interval"].to_value("day")
+            ss += "{:<40s} : {:.3} day\n".format("Peak interval", peak_interval)
+        else:
+            ss += "\nNo peak measured for this source.\n"
+
+        # TODO: Add a lightcurve table with d['Flux_History'] and d['Unc_Flux_History']
+
+        return ss
+
+    def spatial_model(self):
+        """Spatial model (`~gammapy.modeling.models.SpatialModel`)."""
+        d = self.data
+        ra = d["RAJ2000"]
+        dec = d["DEJ2000"]
+
+        if self.is_pointlike:
+            model = PointSpatialModel(lon_0=ra, lat_0=dec, frame="icrs")
+        else:
+            de = self.data_extended
+            morph_type = de["Model_Form"].strip()
+            e = (1 - (de["Model_SemiMinor"] / de["Model_SemiMajor"]) ** 2.0) ** 0.5
+            sigma = de["Model_SemiMajor"]
+            phi = de["Model_PosAng"]
+            if morph_type == "Disk":
+                r_0 = de["Model_SemiMajor"]
+                model = DiskSpatialModel(
+                    lon_0=ra, lat_0=dec, r_0=r_0, e=e, phi=phi, frame="icrs"
+                )
+            elif morph_type in ["Map", "Ring", "2D Gaussian x2"]:
+                filename = de["Spatial_Filename"].strip()
+                path = make_path(
+                    "$GAMMAPY_DATA/catalogs/fermi/LAT_extended_sources_8years/Templates/"
+                )
+                with warnings.catch_warnings():  # ignore FITS units warnings
+                    warnings.simplefilter("ignore", FITSFixedWarning)
+                    model = TemplateSpatialModel.read(path / filename)
+            elif morph_type == "2D Gaussian":
+                model = GaussianSpatialModel(
+                    lon_0=ra, lat_0=dec, sigma=sigma, e=e, phi=phi, frame="icrs"
+                )
+            else:
+                raise ValueError(f"Invalid spatial model: {morph_type!r}")
+        self._set_spatial_errors(model)
+        return model
+
+    def spectral_model(self):
+        """Best fit spectral model (`~gammapy.modeling.models.SpectralModel`)."""
+        spec_type = self.data["SpectrumType"].strip()
+
+        if spec_type == "PowerLaw":
+            tag = "PowerLawSpectralModel"
+            pars = {
+                "reference": self.data["Pivot_Energy"],
+                "amplitude": self.data["PL_Flux_Density"],
+                "index": self.data["PL_Index"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_PL_Flux_Density"],
+                "index": self.data["Unc_PL_Index"],
+            }
+        elif spec_type == "LogParabola":
+            tag = "LogParabolaSpectralModel"
+            pars = {
+                "reference": self.data["Pivot_Energy"],
+                "amplitude": self.data["LP_Flux_Density"],
+                "alpha": self.data["LP_Index"],
+                "beta": self.data["LP_beta"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_LP_Flux_Density"],
+                "alpha": self.data["Unc_LP_Index"],
+                "beta": self.data["Unc_LP_beta"],
+            }
+        elif spec_type == "PLSuperExpCutoff":
+            if "PLEC_ExpfactorS" in self.data:
+                tag = "SuperExpCutoffPowerLaw4FGLDR3SpectralModel"
+                expfactor = self.data["PLEC_ExpfactorS"]
+                expfactor_err = self.data["Unc_PLEC_ExpfactorS"]
+                index_1 = self.data["PLEC_IndexS"]
+                index_1_err = self.data["Unc_PLEC_IndexS"]
+            else:
+                tag = "SuperExpCutoffPowerLaw4FGLSpectralModel"
+                expfactor = self.data["PLEC_Expfactor"]
+                expfactor_err = self.data["Unc_PLEC_Expfactor"]
+                index_1 = self.data["PLEC_Index"]
+                index_1_err = self.data["Unc_PLEC_Index"]
+
+            pars = {
+                "reference": self.data["Pivot_Energy"],
+                "amplitude": self.data["PLEC_Flux_Density"],
+                "index_1": index_1,
+                "index_2": self.data["PLEC_Exp_Index"],
+                "expfactor": expfactor,
+            }
+            errs = {
+                "amplitude": self.data["Unc_PLEC_Flux_Density"],
+                "index_1": index_1_err,
+                "index_2": np.nan_to_num(float(self.data["Unc_PLEC_Exp_Index"])),
+                "expfactor": expfactor_err,
+            }
+        else:
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
+
+        model = Model.create(tag, "spectral", **pars)
+
+        for name, value in errs.items():
+            model.parameters[name].error = value
+
+        return model
+
+    @property
+    def flux_points_table(self):
+        """Flux points (`~astropy.table.Table`)."""
+        table = Table()
+        table.meta.update(self.flux_points_meta)
+
+        table["e_min"] = self.data["fp_energy_edges"][:-1]
+        table["e_max"] = self.data["fp_energy_edges"][1:]
+
+        flux = self._get_flux_values("Flux_Band")
+        flux_err = self._get_flux_values("Unc_Flux_Band")
+        table["flux"] = flux
+        table["flux_errn"] = np.abs(flux_err[:, 0])
+        table["flux_errp"] = flux_err[:, 1]
+
+        nuFnu = self._get_flux_values("nuFnu_Band", "erg cm-2 s-1")
+        table["e2dnde"] = nuFnu
+        table["e2dnde_errn"] = np.abs(nuFnu * flux_err[:, 0] / flux)
+        table["e2dnde_errp"] = nuFnu * flux_err[:, 1] / flux
+
+        is_ul = np.isnan(table["flux_errn"])
+        table["is_ul"] = is_ul
+
+        # handle upper limits
+        table["flux_ul"] = np.nan * flux_err.unit
+        flux_ul = compute_flux_points_ul(table["flux"], table["flux_errp"])
+        table["flux_ul"][is_ul] = flux_ul[is_ul]
+
+        # handle upper limits
+        table["e2dnde_ul"] = np.nan * nuFnu.unit
+        e2dnde_ul = compute_flux_points_ul(table["e2dnde"], table["e2dnde_errp"])
+        table["e2dnde_ul"][is_ul] = e2dnde_ul[is_ul]
+
+        # Square root of test statistic
+        table["sqrt_ts"] = self.data["Sqrt_TS_Band"]
+        return table
+
+    def _get_flux_values(self, prefix, unit="cm-2 s-1"):
+        values = self.data[prefix]
+        return u.Quantity(values, unit)
+
+    def lightcurve(self, interval="1-year"):
+        """Lightcurve (`~gammapy.estimators.FluxPoints`).
+
+        Parameters
+        ----------
+        interval : {'1-year', '2-month'}
+            Time interval of the lightcurve. Default is '1-year'.
+            Note that '2-month' is not available for all catalogue version.
+        """
+
+        if interval == "1-year":
+            tag = "Flux_History"
+            if tag not in self.data or "time_axis" not in self.data:
+                raise ValueError(
+                    "'1-year' interval is not available for this catalogue version"
+                )
+            time_axis = self.data["time_axis"]
+            tag_sqrt_ts = "Sqrt_TS_History"
+
+        elif interval == "2-month":
+            tag = "Flux2_History"
+            if tag not in self.data or "time_axis_2" not in self.data:
+                raise ValueError(
+                    "2-month interval is not available for this catalogue version"
+                )
+            time_axis = self.data["time_axis_2"]
+            tag_sqrt_ts = "Sqrt_TS2_History"
+        else:
+            raise ValueError("Time intervals available are '1-year' or '2-month'")
+
+        energy_axis = MapAxis.from_energy_edges([50, 300000] * u.MeV)
+        geom = RegionGeom.create(region=self.position, axes=[energy_axis, time_axis])
+
+        names = ["flux", "flux_errp", "flux_errn", "flux_ul", "ts"]
+        maps = Maps.from_geom(geom=geom, names=names)
+
+        maps["flux"].quantity = self.data[tag]
+        maps["flux_errp"].quantity = self.data[f"Unc_{tag}"][:, 1]
+        maps["flux_errn"].quantity = -self.data[f"Unc_{tag}"][:, 0]
+        maps["flux_ul"].quantity = compute_flux_points_ul(
+            maps["flux"].quantity, maps["flux_errp"].quantity
+        )
+        maps["ts"].quantity = self.data[tag_sqrt_ts] ** 2
+
+        return FluxPoints.from_maps(
+            maps=maps,
+            sed_type="flux",
+            reference_model=self.sky_model(),
+            meta=self.flux_points.meta.copy(),
+        )
+
+
+class SourceCatalogObject3FGL(SourceCatalogObjectFermiBase):
     """One source from the Fermi-LAT 3FGL catalog.
 
     Catalog is represented by `~gammapy.catalog.SourceCatalog3FGL`.
     """
-    _ebounds = EnergyBounds([100, 300, 1000, 3000, 10000, 100000], 'MeV')
-    _ebounds_suffix = ['100_300', '300_1000',
-                       '1000_3000', '3000_10000', '10000_100000']
-    energy_range = u.Quantity([100, 100000], 'MeV')
-    """Energy range of the catalog.
+
+    _energy_edges = u.Quantity([100, 300, 1000, 3000, 10000, 100000], "MeV")
+    _energy_edges_suffix = [
+        "100_300",
+        "300_1000",
+        "1000_3000",
+        "3000_10000",
+        "10000_100000",
+    ]
+    energy_range = u.Quantity([100, 100000], "MeV")
+    """Energy range used for the catalog.
 
     Paper says that analysis uses data up to 300 GeV,
     but results are all quoted up to 100 GeV only to
     be consistent with previous catalogs.
     """
 
-    def __str__(self):
-        return self.info()
-
-    def info(self, info='all'):
-        """Summary info string.
-
-        Parameters
-        ----------
-        info : {'all', 'basic', 'position', 'spectral', 'lightcurve'}
-            Comma separated list of options
-        """
-        if info == 'all':
-            info = 'basic,position,spectral,lightcurve'
-
-        ss = ''
-        ops = info.split(',')
-        if 'basic' in ops:
-            ss += self._info_basic()
-        if 'position' in ops:
-            ss += self._info_position()
-        if 'spectral' in ops:
-            ss += self._info_spectral_fit()
-            ss += self._info_spectral_points()
-        if 'lightcurve' in ops:
-            ss += self._info_lightcurve()
-        return ss
-
-    def _info_basic(self):
-        """Print basic info."""
+    def _info_more(self):
         d = self.data
-        ss = '\n*** Basic info ***\n\n'
-        ss += 'Catalog row index (zero-based) : {}\n'.format(d['catalog_row_index'])
-        ss += '{:<20s} : {}\n'.format('Source name', d['Source_Name'])
-        ss += '{:<20s} : {}\n'.format('Extended name', d['Extended_Source_Name'])
-
-        def get_nonentry_keys(keys):
-            vals = [d[_].strip() for _ in keys]
-            return ', '.join([_ for _ in vals if _ != ''])
-
-        keys = ['ASSOC1', 'ASSOC2', 'ASSOC_TEV', 'ASSOC_GAM1', 'ASSOC_GAM2', 'ASSOC_GAM3']
-        associations = get_nonentry_keys(keys)
-        ss += '{:<20s} : {}\n'.format('Associations', associations)
-
-        keys = ['0FGL_Name', '1FGL_Name', '2FGL_Name', '1FHL_Name']
-        other_names = get_nonentry_keys(keys)
-        ss += '{:<20s} : {}\n'.format('Other names', other_names)
-
-        ss += '{:<20s} : {}\n'.format('Class', d['CLASS1'])
-
-        tevcat_flag = d['TEVCAT_FLAG']
-        if tevcat_flag == 'N':
-            tevcat_message = 'No TeV association'
-        elif tevcat_flag == 'P':
-            tevcat_message = 'Small TeV source'
-        elif tevcat_flag == 'E':
-            tevcat_message = 'Extended TeV source (diameter > 40 arcmins)'
-        else:
-            tevcat_message = 'N/A'
-        ss += '{:<20s} : {}\n'.format('TeVCat flag', tevcat_message)
-
-        flag_message = {
-            0: 'None',
-            1: 'Source with TS > 35 which went to TS < 25 when changing the diffuse model. Note that sources with TS < '
-               '35 are not flagged with this bit because normal statistical fluctuations can push them to TS < 25.',
-            3: 'Flux (> 1 GeV) or energy flux (> 100 MeV) changed by more than 3 sigma when changing the diffuse model.'
-               ' Requires also that the flux change by more than 35% (to not flag strong sources).',
-            4: 'Source-to-background ratio less than 10% in highest band in which TS > 25. Background is integrated '
-               'over the 68%-confidence area (pi*r_682) or 1 square degree, whichever is smaller.',
-            5: 'Closer than theta_ref from a brighter neighbor, where theta_ref is defined in the highest band in which'
-               ' source TS > 25, or the band with highest TS if all are < 25. theta_ref is set to 2.17 degrees (FWHM)'
-               ' below 300 MeV, 1.38 degrees between 300 MeV and 1 GeV, 0.87 degrees between 1 GeV and 3 GeV, 0.67'
-               ' degrees between 3 and 10 GeV and 0.45 degrees about 10 GeV (2*r_68).',
-            6: 'On top of an interstellar gas clump or small-scale defect in the model of diffuse emission. This flag '
-               'is equivalent to the "c" suffix in the source name.',
-            7: 'Unstable position determination; result from gtfindsrc outside the 95% ellipse from pointlike.',
-            9: 'Localization Quality > 8 in pointlike (see Section 3.1 in catalog paper) or long axis of 95% ellipse >'
-               ' 0.25.',
-            10: 'Spectral Fit Quality > 16.3 (see Equation 3 in 2FGL catalog paper).',
-            11: 'Possibly due to the Sun (see Section 3.6 in catalog paper).',
-            12: 'Highly curved spectrum; LogParabola beta fixed to 1 or PLExpCutoff Spectral Index fixed to 0 (see '
-                'Section 3.3 in catalog paper).'
-        }
-        ss += '{:<20s} : {}\n'.format('Other flags', flag_message.get(d['Flags'], 'N/A'))
-
-        return ss
-
-    def _info_position(self):
-        """Print position info."""
-        d = self.data
-        ss = '\n*** Position info ***\n\n'
-        ss += '{:<20s} : {:.3f}\n'.format('RA', d['RAJ2000'])
-        ss += '{:<20s} : {:.3f}\n'.format('DEC', d['DEJ2000'])
-        ss += '{:<20s} : {:.3f}\n'.format('GLON', d['GLON'])
-        ss += '{:<20s} : {:.3f}\n'.format('GLAT', d['GLAT'])
-
-        ss += '\n'
-        ss += '{:<20s} : {:.4f}\n'.format('Semimajor (68%)', d['Conf_68_SemiMajor'])
-        ss += '{:<20s} : {:.4f}\n'.format('Semiminor (68%)', d['Conf_68_SemiMinor'])
-        ss += '{:<20s} : {:.2f}\n'.format('Position angle (68%)', d['Conf_68_PosAng'])
-        ss += '{:<20s} : {:.4f}\n'.format('Semimajor (95%)', d['Conf_95_SemiMajor'])
-        ss += '{:<20s} : {:.4f}\n'.format('Semiminor (95%)', d['Conf_95_SemiMinor'])
-        ss += '{:<20s} : {:.2f}\n'.format('Position angle (95%)', d['Conf_95_PosAng'])
-        ss += '{:<20s} : {:.0f}\n'.format('ROI number', d['ROI_num'])
-
+        ss = "\n*** Other info ***\n\n"
+        ss += "{:<20s} : {}\n".format("Other flags", d["Flags"])
         return ss
 
     def _info_spectral_fit(self):
-        """Print spectral info."""
         d = self.data
-        spec_type = d['SpectrumType'].strip()
+        spec_type = d["SpectrumType"].strip()
 
-        ss = '\n*** Spectral info ***\n\n'
+        ss = "\n*** Spectral info ***\n\n"
 
-        ss += '{:<45s} : {}\n'.format('Spectrum type', d['SpectrumType'])
-        fmt = '{:<45s} : {:.3f}\n'
-        args = ('Detection significance (100 MeV - 300 GeV)', d['Signif_Avg'])
-        ss += fmt.format(*args)
-        ss += '{:<45s} : {:.1f}\n'.format('Significance curvature', d['Signif_Curve'])
+        ss += "{:<45s} : {}\n".format("Spectrum type", d["SpectrumType"])
+        fmt = "{:<45s} : {:.3f}\n"
+        ss += fmt.format("Detection significance (100 MeV - 300 GeV)", d["Signif_Avg"])
+        ss += "{:<45s} : {:.1f}\n".format("Significance curvature", d["Signif_Curve"])
 
-        if spec_type == 'PowerLaw':
+        if spec_type == "PowerLaw":
             pass
-        elif spec_type == 'LogParabola':
-            ss += '{:<45s} : {} +- {}\n'.format('beta', d['beta'], d['Unc_beta'])
-        elif spec_type in ['PLExpCutoff', 'PlSuperExpCutoff']:
-            fmt = '{:<45s} : {:.0f} +- {:.0f} {}\n'
-            args = ('Cutoff energy', d['Cutoff'].value, d['Unc_Cutoff'].value, d['Cutoff'].unit)
-            ss += fmt.format(*args)
-        elif spec_type == 'PLSuperExpCutoff':
-            ss += '{:<45s} : {} +- {}\n'.format('Super-exponential cutoff index', d['Exp_Index'], d['Unc_Exp_Index'])
+        elif spec_type == "LogParabola":
+            ss += "{:<45s} : {} +- {}\n".format("beta", d["beta"], d["Unc_beta"])
+        elif spec_type in ["PLExpCutoff", "PlSuperExpCutoff"]:
+            fmt = "{:<45s} : {:.0f} +- {:.0f} {}\n"
+            ss += fmt.format(
+                "Cutoff energy",
+                d["Cutoff"].value,
+                d["Unc_Cutoff"].value,
+                d["Cutoff"].unit,
+            )
+        elif spec_type == "PLSuperExpCutoff":
+            ss += "{:<45s} : {} +- {}\n".format(
+                "Super-exponential cutoff index", d["Exp_Index"], d["Unc_Exp_Index"]
+            )
         else:
-            raise ValueError('This case should not exist. Please report this issue.')
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
 
-        ss += '{:<45s} : {:.0f} {}\n'.format('Pivot energy', d['Pivot_Energy'].value, d['Pivot_Energy'].unit)
+        ss += "{:<45s} : {:.0f} {}\n".format(
+            "Pivot energy", d["Pivot_Energy"].value, d["Pivot_Energy"].unit
+        )
 
-        ss += '{:<45s} : {:.3f}\n'.format('Power law spectral index', d['PowerLaw_Index'])
+        ss += "{:<45s} : {:.3f}\n".format(
+            "Power law spectral index", d["PowerLaw_Index"]
+        )
 
-        fmt = '{:<45s} : {:.3f} +- {:.3f}\n'
-        args = ('Spectral index', d['Spectral_Index'], d['Unc_Spectral_Index'])
-        ss += fmt.format(*args)
+        fmt = "{:<45s} : {:.3f} +- {:.3f}\n"
+        ss += fmt.format("Spectral index", d["Spectral_Index"], d["Unc_Spectral_Index"])
 
-        unit = 'cm-2 MeV-1 s-1'
-        fmt = '{:<45s} : {:.3} +- {:.3} {}\n'
-        args = ('Flux Density at pivot energy', d['Flux_Density'].value, d['Unc_Flux_Density'].value, unit)
-        ss += fmt.format(*args)
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Flux Density at pivot energy",
+            d["Flux_Density"].value,
+            d["Unc_Flux_Density"].value,
+            "cm-2 MeV-1 s-1",
+        )
 
-        unit = 'cm-2 s-1'
-        fmt = '{:<45s} : {:.3} +- {:.3} {}\n'
-        args = ('Integral flux (1 - 100 GeV)', d['Flux1000'].value, d['Unc_Flux1000'].value, unit)
-        ss += fmt.format(*args)
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Integral flux (1 - 100 GeV)",
+            d["Flux1000"].value,
+            d["Unc_Flux1000"].value,
+            "cm-2 s-1",
+        )
 
-        unit = 'erg cm-2 s-1'
-        fmt = '{:<45s} : {:.3} +- {:.3} {}\n'
-        args = ('Energy flux (100 MeV - 100 GeV)', d['Energy_Flux100'].value, d['Unc_Energy_Flux100'].value, unit)
-        ss += fmt.format(*args)
+        fmt = "{:<45s} : {:.3} +- {:.3} {}\n"
+        ss += fmt.format(
+            "Energy flux (100 MeV - 100 GeV)",
+            d["Energy_Flux100"].value,
+            d["Unc_Energy_Flux100"].value,
+            "erg cm-2 s-1",
+        )
 
         return ss
 
-    def _info_spectral_points(self):
-        """Print spectral points."""
-        ss = '\n*** Spectral points ***\n\n'
-        lines = self._flux_points_table_formatted.pformat(max_width=-1, max_lines=-1)
-        ss += '\n'.join(lines)
-
-        return ss + '\n'
-
     def _info_lightcurve(self):
-        """Print lightcurve info."""
         d = self.data
-        ss = '\n*** Lightcurve info ***\n\n'
-        ss += 'Lightcurve measured in the energy band: 100 MeV - 100 GeV\n\n'
+        ss = "\n*** Lightcurve info ***\n\n"
+        ss += "Lightcurve measured in the energy band: 100 MeV - 100 GeV\n\n"
 
-        ss += '{:<15s} : {:.3f}\n'.format('Variability index', d['Variability_Index'])
+        ss += "{:<15s} : {:.3f}\n".format("Variability index", d["Variability_Index"])
 
-        if d['Signif_Peak'] == np.nan:
-            ss += '{:<40s} : {:.3f}\n'.format('Significance peak (100 MeV - 100 GeV)', d['Signif_Peak'])
+        if np.isfinite(d["Flux_Peak"]):
+            ss += "{:<40s} : {:.3f}\n".format(
+                "Significance peak (100 MeV - 100 GeV)", d["Signif_Peak"]
+            )
 
-            fmt = '{:<40s} : {:.3} +- {:.3} cm^-2 s^-1\n'
-            args = ('Integral flux peak (100 MeV - 100 GeV)', d['Flux_Peak'], d['Unc_Flux_Peak'])
-            ss += fmt.format(*args)
+            fmt = "{:<40s} : {:.3} +- {:.3} cm^-2 s^-1\n"
+            ss += fmt.format(
+                "Integral flux peak (100 MeV - 100 GeV)",
+                d["Flux_Peak"].value,
+                d["Unc_Flux_Peak"].value,
+            )
 
             # TODO: give time as UTC string, not MET
-            ss += '{:<40s} : {:.3} s (Mission elapsed time)\n'.format('Time peak', d['Time_Peak'])
-            peak_interval = d['Peak_Interval'].to('day').value
-            ss += '{:<40s} : {:.3} day\n'.format('Peak interval', peak_interval)
+            ss += "{:<40s} : {:.3} s (Mission elapsed time)\n".format(
+                "Time peak", d["Time_Peak"].value
+            )
+            peak_interval = d["Peak_Interval"].to_value("day")
+            ss += "{:<40s} : {:.3} day\n".format("Peak interval", peak_interval)
         else:
-            ss += '\nNo peak measured for this source.\n'
+            ss += "\nNo peak measured for this source.\n"
 
         # TODO: Add a lightcurve table with d['Flux_History'] and d['Unc_Flux_History']
 
         return ss
 
-    @property
     def spectral_model(self):
-        """Best fit spectral model (`~gammapy.spectrum.SpectralModel`)."""
-        spec_type = self.data['SpectrumType'].strip()
+        """Best fit spectral model (`~gammapy.modeling.models.SpectralModel`)."""
+        spec_type = self.data["SpectrumType"].strip()
 
-        pars, errs = {}, {}
-        pars['amplitude'] = self.data['Flux_Density']
-        errs['amplitude'] = self.data['Unc_Flux_Density']
-        pars['reference'] = self.data['Pivot_Energy']
-
-        if spec_type == 'PowerLaw':
-            pars['index'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-            errs['index'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-            model = PowerLaw(**pars)
-        elif spec_type == 'PLExpCutoff':
-            pars['index'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-            pars['ecut'] = self.data['Cutoff']
-            errs['index'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-            errs['ecut'] = self.data['Unc_Cutoff']
-            model = ExponentialCutoffPowerLaw3FGL(**pars)
-        elif spec_type == 'LogParabola':
-            pars['alpha'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-            pars['beta'] = self.data['beta'] * u.dimensionless_unscaled
-            errs['alpha'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-            errs['beta'] = self.data['Unc_beta'] * u.dimensionless_unscaled
-            model = LogParabola(**pars)
+        if spec_type == "PowerLaw":
+            tag = "PowerLawSpectralModel"
+            pars = {
+                "amplitude": self.data["Flux_Density"],
+                "reference": self.data["Pivot_Energy"],
+                "index": self.data["Spectral_Index"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_Flux_Density"],
+                "index": self.data["Unc_Spectral_Index"],
+            }
+        elif spec_type == "PLExpCutoff":
+            tag = "ExpCutoffPowerLaw3FGLSpectralModel"
+            pars = {
+                "amplitude": self.data["Flux_Density"],
+                "reference": self.data["Pivot_Energy"],
+                "index": self.data["Spectral_Index"],
+                "ecut": self.data["Cutoff"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_Flux_Density"],
+                "index": self.data["Unc_Spectral_Index"],
+                "ecut": self.data["Unc_Cutoff"],
+            }
+        elif spec_type == "LogParabola":
+            tag = "LogParabolaSpectralModel"
+            pars = {
+                "amplitude": self.data["Flux_Density"],
+                "reference": self.data["Pivot_Energy"],
+                "alpha": self.data["Spectral_Index"],
+                "beta": self.data["beta"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_Flux_Density"],
+                "alpha": self.data["Unc_Spectral_Index"],
+                "beta": self.data["Unc_beta"],
+            }
         elif spec_type == "PLSuperExpCutoff":
-            # TODO: why convert to GeV here? Remove?
-            pars['reference'] = pars['reference'].to('GeV')
-            pars['index_1'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-            pars['index_2'] = self.data['Exp_Index'] * u.dimensionless_unscaled
-            pars['ecut'] = self.data['Cutoff'].to('GeV')
-            errs['index_1'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-            errs['index_2'] = self.data['Unc_Exp_Index'] * u.dimensionless_unscaled
-            errs['ecut'] = self.data['Unc_Cutoff'].to('GeV')
-            model = PLSuperExpCutoff3FGL(**pars)
+            tag = "SuperExpCutoffPowerLaw3FGLSpectralModel"
+            pars = {
+                "amplitude": self.data["Flux_Density"],
+                "reference": self.data["Pivot_Energy"],
+                "index_1": self.data["Spectral_Index"],
+                "index_2": self.data["Exp_Index"],
+                "ecut": self.data["Cutoff"],
+            }
+            errs = {
+                "amplitude": self.data["Unc_Flux_Density"],
+                "index_1": self.data["Unc_Spectral_Index"],
+                "index_2": self.data["Unc_Exp_Index"],
+                "ecut": self.data["Unc_Cutoff"],
+            }
         else:
-            raise ValueError('No spec_type: {}. Please report this issue.'.format(spec_type))
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
 
-        model.parameters.set_parameter_errors(errs)
+        model = Model.create(tag, "spectral", **pars)
+
+        for name, value in errs.items():
+            model.parameters[name].error = value
+
         return model
 
-    def spatial_model(self, emin=1 * u.TeV, emax=10 * u.TeV):
-        """
-        Source spatial model.
-        """
+    def spatial_model(self):
+        """Spatial model (`~gammapy.modeling.models.SpatialModel`)."""
         d = self.data
-        flux = self.spectral_model.integral(emin, emax)
-        amplitude = flux.to('cm-2 s-1').value
-
-        pars = {}
-        glon = Angle(d['GLON']).wrap_at('180d')
-        glat = Angle(d['GLAT']).wrap_at('180d')
+        ra = d["RAJ2000"]
+        dec = d["DEJ2000"]
 
         if self.is_pointlike:
-            pars['amplitude'] = amplitude
-            pars['x_0'] = glon.value
-            pars['y_0'] = glat.value
-            return Delta2D(**pars)
+            model = PointSpatialModel(lon_0=ra, lat_0=dec, frame="icrs")
         else:
             de = self.data_extended
-            morph_type = de['Model_Form'].strip()
-
-            if morph_type == 'Disk':
-                pars['x_0'] = glon.value
-                pars['y_0'] = glat.value
-                pars['R_0'] = de['Model_SemiMajor'].to('deg').value
-                pars['amplitude'] = amplitude / (np.pi * pars['R_0'] ** 2)
-                return Disk2D(**pars)
-            elif morph_type in ['Map', 'Ring', '2D Gaussian x2']:
-                filename = de['Spatial_Filename'].strip()
-                base = '$GAMMAPY_EXTRA/datasets/catalogs/fermi/Extended_archive_v15/Templates/'
-                template = Template2D.read(base + filename)
-                template.amplitude = amplitude
-                return template
-            elif morph_type == '2D Gaussian':
-                pars['x_mean'] = glon.value
-                pars['y_mean'] = glat.value
-                pars['x_stddev'] = de['Model_SemiMajor'].to('deg').value
-                pars['y_stddev'] = de['Model_SemiMajor'].to('deg').value
-                pars['amplitude'] = amplitude * 1 / (2 * np.pi * pars['x_stddev'] ** 2)
-                return Gaussian2D(**pars)
+            morph_type = de["Model_Form"].strip()
+            e = (1 - (de["Model_SemiMinor"] / de["Model_SemiMajor"]) ** 2.0) ** 0.5
+            sigma = de["Model_SemiMajor"]
+            phi = de["Model_PosAng"]
+            if morph_type == "Disk":
+                r_0 = de["Model_SemiMajor"]
+                model = DiskSpatialModel(
+                    lon_0=ra, lat_0=dec, r_0=r_0, e=e, phi=phi, frame="icrs"
+                )
+            elif morph_type in ["Map", "Ring", "2D Gaussian x2"]:
+                filename = de["Spatial_Filename"].strip()
+                path = make_path(
+                    "$GAMMAPY_DATA/catalogs/fermi/Extended_archive_v15/Templates/"
+                )
+                model = TemplateSpatialModel.read(path / filename)
+            elif morph_type == "2D Gaussian":
+                model = GaussianSpatialModel(
+                    lon_0=ra, lat_0=dec, sigma=sigma, e=e, phi=phi, frame="icrs"
+                )
             else:
-                raise ValueError('Not a valid spatial model{}'.format(morph_type))
-
-    @property
-    def is_pointlike(self):
-        return self.data['Extended_Source_Name'].strip() == ''
-
-    @property
-    def _flux_points_table_formatted(self):
-        """Returns formatted version of self.flux_points.table"""
-        table = self.flux_points.table.copy()
-        flux_cols = ['flux', 'flux_errn', 'flux_errp', 'e2dnde', 'e2dnde_errn',
-                     'e2dnde_errp', 'flux_ul', 'e2dnde_ul', 'dnde']
-        table['sqrt_TS'].format = '.1f'
-        table['e_ref'].format = '.1f'
-        for _ in flux_cols:
-            table[_].format = '.3'
-
-        return table
-
-    @property
-    def flux_points(self):
-        """Flux points (`~gammapy.spectrum.FluxPoints`)."""
-        table = Table()
-        table.meta['SED_TYPE'] = 'flux'
-        e_ref = self._ebounds.log_centers
-        table['e_ref'] = e_ref
-        table['e_min'] = self._ebounds.lower_bounds
-        table['e_max'] = self._ebounds.upper_bounds
-
-        flux = self._get_flux_values('Flux')
-        flux_err = self._get_flux_values('Unc_Flux')
-        table['flux'] = flux
-        table['flux_errn'] = np.abs(flux_err[:, 0])
-        table['flux_errp'] = flux_err[:, 1]
-
-        nuFnu = self._get_flux_values('nuFnu', 'erg cm-2 s-1')
-        table['e2dnde'] = nuFnu
-        table['e2dnde_errn'] = np.abs(nuFnu * flux_err[:, 0] / flux)
-        table['e2dnde_errp'] = nuFnu * flux_err[:, 1] / flux
-
-        is_ul = np.isnan(table['flux_errn'])
-        table['is_ul'] = is_ul
-
-        # handle upper limits
-        table['flux_ul'] = np.nan * flux_err.unit
-        flux_ul = compute_flux_points_ul(table['flux'], table['flux_errp'])
-        table['flux_ul'][is_ul] = flux_ul[is_ul]
-
-        # handle upper limits
-        table['e2dnde_ul'] = np.nan * nuFnu.unit
-        e2dnde_ul = compute_flux_points_ul(table['e2dnde'], table['e2dnde_errp'])
-        table['e2dnde_ul'][is_ul] = e2dnde_ul[is_ul]
-
-        # Square root of test statistic
-        table['sqrt_TS'] = [self.data['Sqrt_TS' + _] for _ in self._ebounds_suffix]
-
-        table['dnde'] = (nuFnu * e_ref ** -2).to('TeV-1 cm-2 s-1')
-        return FluxPoints(table)
-
-    def _get_flux_values(self, prefix, unit='cm-2 s-1'):
-        values = [self.data[prefix + _] for _ in self._ebounds_suffix]
-        return u.Quantity(values, unit)
-
-    @property
-    def lightcurve(self):
-        """Lightcurve (`~gammapy.time.LightCurve`)."""
-        flux = self.data['Flux_History']
-
-        # Flux error is given as asymmetric high/low
-        flux_err_lo = self.data['Unc_Flux_History'][:, 0]
-        flux_err_hi = self.data['Unc_Flux_History'][:, 1]
-
-        # TODO: Change lightcurve class to support this,
-        # then fill appropriately here
-        # for now, we just use the mean
-        flux_err = 0.5 * (-flux_err_lo + flux_err_hi)
-
-        # Really the time binning is stored in a separate HDU in the FITS
-        # catalog file called `Hist_Start`, with a single column `Hist_Start`
-        # giving the time binning in MET (mission elapsed time)
-        # This is not available here for now.
-        # TODO: read that info in `SourceCatalog3FGL` and pass it down to the
-        # `SourceCatalogObject3FGL` object somehow.
-
-        # For now, we just hard-code the start and stop time and assume
-        # equally-spaced time intervals. This is roughly correct,
-        # for plotting the difference doesn't matter, only for analysis
-        time_start = Time('2008-08-02T00:33:19')
-        time_end = Time('2012-07-31T22:45:47')
-
-        n_points = len(flux)
-        time_step = (time_end - time_start) / n_points
-        time_bounds = time_start + np.arange(n_points + 1) * time_step
-        table = QTable()
-        table['TIME_MIN'] = time_bounds[:-1]
-        table['TIME_MAX'] = time_bounds[1:]
-        table['FLUX'] = flux
-        table['FLUX_ERR'] = flux_err
-        lc = LightCurve(table)
-        return lc
-
-
-class SourceCatalogObject1FHL(SourceCatalogObject):
-    """One source from the Fermi-LAT 1FHL catalog.
-
-    Catalog is represented by `~gammapy.catalog.SourceCatalog1FHL`.
-    """
-    _ebounds = EnergyBounds([10, 30, 100, 500], 'GeV')
-    _ebounds_suffix = ['10_30', '30_100', '100_500']
-    energy_range = u.Quantity([0.01, 0.5], 'TeV')
-    """Energy range of the Fermi 1FHL source catalog"""
-
-    def __str__(self):
-        return self.info()
-
-    def info(self):
-        """Print summary info."""
-        # TODO: can we share code with 3FGL summary function?
-        d = self.data
-
-        ss = 'Source: {}\n'.format(d['Source_Name'])
-        ss += '\n'
-
-        ss += 'RA (J2000)  : {}\n'.format(d['RAJ2000'])
-        ss += 'Dec (J2000) : {}\n'.format(d['DEJ2000'])
-        ss += 'GLON        : {}\n'.format(d['GLON'])
-        ss += 'GLAT        : {}\n'.format(d['GLAT'])
-        ss += '\n'
-
-        # val, err = d['Energy_Flux100'], d['Unc_Energy_Flux100']
-        # ss += 'Energy flux (100 MeV - 100 GeV) : {} +- {} erg cm^-2 s^-1\n'.format(val, err)
-        # ss += 'Detection significance : {}\n'.format(d['Signif_Avg'])
-
-        return ss
-
-    def _get_flux_values(self, prefix, unit='cm-2 s-1'):
-        values = [self.data[prefix + _ + 'GeV'] for _ in self._ebounds_suffix]
-        return u.Quantity(values, unit)
-
-    @property
-    def flux_points(self):
-        """Integral flux points (`~gammapy.spectrum.FluxPoints`)."""
-        table = Table()
-        table.meta['SED_TYPE'] = 'flux'
-        table['e_min'] = self._ebounds.lower_bounds
-        table['e_max'] = self._ebounds.upper_bounds
-        table['flux'] = self._get_flux_values('Flux')
-        flux_err = self._get_flux_values('Unc_Flux')
-        table['flux_errn'] = np.abs(flux_err[:, 0])
-        table['flux_errp'] = flux_err[:, 1]
-
-        # handle upper limits
-        is_ul = np.isnan(table['flux_errn'])
-        table['is_ul'] = is_ul
-        table['flux_ul'] = np.nan * flux_err.unit
-        flux_ul = compute_flux_points_ul(table['flux'], table['flux_errp'])
-        table['flux_ul'][is_ul] = flux_ul[is_ul]
-
-        flux_points = FluxPoints(table)
-
-        # TODO: change this and leave it up to the caller to convert to dnde
-        # See https://github.com/gammapy/gammapy/issues/1034
-        return flux_points.to_sed_type('dnde', model=self.spectral_model)
-
-    @property
-    def spectral_model(self):
-        """Best fit spectral model `~gammapy.spectrum.models.SpectralModel`."""
-        pars, errs = {}, {}
-        pars['amplitude'] = self.data['Flux']
-        pars['emin'], pars['emax'] = self.energy_range
-        pars['index'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-        errs['amplitude'] = self.data['Unc_Flux']
-        errs['index'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-        model = PowerLaw2(**pars)
-        model.parameters.set_parameter_errors(errs)
+                raise ValueError(f"Invalid spatial model: {morph_type!r}")
+        self._set_spatial_errors(model)
         return model
 
+    @property
+    def flux_points_table(self):
+        """Flux points (`~astropy.table.Table`)."""
+        table = Table()
+        table.meta.update(self.flux_points_meta)
 
-class SourceCatalogObject2FHL(SourceCatalogObject):
+        table["e_min"] = self._energy_edges[:-1]
+        table["e_max"] = self._energy_edges[1:]
+
+        flux = self._get_flux_values("Flux")
+        flux_err = self._get_flux_values("Unc_Flux")
+        table["flux"] = flux
+        table["flux_errn"] = np.abs(flux_err[:, 0])
+        table["flux_errp"] = flux_err[:, 1]
+
+        nuFnu = self._get_flux_values("nuFnu", "erg cm-2 s-1")
+        table["e2dnde"] = nuFnu
+        table["e2dnde_errn"] = np.abs(nuFnu * flux_err[:, 0] / flux)
+        table["e2dnde_errp"] = nuFnu * flux_err[:, 1] / flux
+
+        is_ul = np.isnan(table["flux_errn"])
+        table["is_ul"] = is_ul
+
+        # handle upper limits
+        table["flux_ul"] = np.nan * flux_err.unit
+        flux_ul = compute_flux_points_ul(table["flux"], table["flux_errp"])
+        table["flux_ul"][is_ul] = flux_ul[is_ul]
+
+        # handle upper limits
+        table["e2dnde_ul"] = np.nan * nuFnu.unit
+        e2dnde_ul = compute_flux_points_ul(table["e2dnde"], table["e2dnde_errp"])
+        table["e2dnde_ul"][is_ul] = e2dnde_ul[is_ul]
+
+        # Square root of test statistic
+        table["sqrt_ts"] = [self.data["Sqrt_TS" + _] for _ in self._energy_edges_suffix]
+        return table
+
+    def _get_flux_values(self, prefix, unit="cm-2 s-1"):
+        values = [self.data[prefix + _] for _ in self._energy_edges_suffix]
+        return u.Quantity(values, unit)
+
+    def lightcurve(self):
+        """Lightcurve (`~gammapy.estimators.FluxPoints`)."""
+        time_axis = self.data["time_axis"]
+        tag = "Flux_History"
+
+        energy_axis = MapAxis.from_energy_edges(self.energy_range)
+        geom = RegionGeom.create(region=self.position, axes=[energy_axis, time_axis])
+
+        names = ["flux", "flux_errp", "flux_errn", "flux_ul"]
+        maps = Maps.from_geom(geom=geom, names=names)
+
+        maps["flux"].quantity = self.data[tag]
+        maps["flux_errp"].quantity = self.data[f"Unc_{tag}"][:, 1]
+        maps["flux_errn"].quantity = -self.data[f"Unc_{tag}"][:, 0]
+        maps["flux_ul"].quantity = compute_flux_points_ul(
+            maps["flux"].quantity, maps["flux_errp"].quantity
+        )
+        is_ul = np.isnan(maps["flux_errn"])
+        maps["flux_ul"].data[~is_ul] = np.nan
+
+        return FluxPoints.from_maps(
+            maps=maps,
+            sed_type="flux",
+            reference_model=self.sky_model(),
+            meta=self.flux_points_meta.copy(),
+        )
+
+
+class SourceCatalogObject2FHL(SourceCatalogObjectFermiBase):
     """One source from the Fermi-LAT 2FHL catalog.
 
     Catalog is represented by `~gammapy.catalog.SourceCatalog2FHL`.
     """
-    _ebounds = EnergyBounds([50, 171, 585, 2000], 'GeV')
-    _ebounds_suffix = ['50_171', '171_585', '585_2000']
-    energy_range = u.Quantity([0.05, 2], 'TeV')
-    """Energy range of the Fermi 2FHL source catalog"""
 
-    def __str__(self):
-        return self.info()
+    asso = ["ASSOC", "3FGL_Name", "1FHL_Name", "TeVCat_Name"]
+    _energy_edges = u.Quantity([50, 171, 585, 2000], "GeV")
+    _energy_edges_suffix = ["50_171", "171_585", "585_2000"]
+    energy_range = u.Quantity([0.05, 2], "TeV")
+    """Energy range used for the catalog."""
 
-    def info(self):
-        """Print summary info."""
-        # TODO: can we share code with 3FGL summary funtion?
+    def _info_more(self):
+        d = self.data
+        ss = "\n*** Other info ***\n\n"
+        fmt = "{:<32s} : {:.3f}\n"
+        ss += fmt.format("Test statistic (50 GeV - 2 TeV)", d["TS"])
+        return ss
+
+    def _info_position(self):
+        d = self.data
+        ss = "\n*** Position info ***\n\n"
+        ss += "{:<20s} : {:.3f}\n".format("RA", d["RAJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("DEC", d["DEJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("GLON", d["GLON"])
+        ss += "{:<20s} : {:.3f}\n".format("GLAT", d["GLAT"])
+
+        ss += "\n"
+        ss += "{:<20s} : {:.4f}\n".format("Error on position (68%)", d["Pos_err_68"])
+        ss += "{:<20s} : {:.0f}\n".format("ROI number", d["ROI"])
+        return ss
+
+    def _info_spectral_fit(self):
         d = self.data
 
-        ss = 'Source: {}\n'.format(d['Source_Name'])
-        ss += '\n'
+        ss = "\n*** Spectral fit info ***\n\n"
 
-        ss += 'RA (J2000)  : {}\n'.format(d['RAJ2000'])
-        ss += 'Dec (J2000) : {}\n'.format(d['DEJ2000'])
-        ss += 'GLON        : {}\n'.format(d['GLON'])
-        ss += 'GLAT        : {}\n'.format(d['GLAT'])
-        ss += '\n'
+        fmt = "{:<32s} : {:.3f} +- {:.3f}\n"
+        ss += fmt.format(
+            "Power-law spectral index", d["Spectral_Index"], d["Unc_Spectral_Index"]
+        )
 
-        # val, err = d['Energy_Flux100'], d['Unc_Energy_Flux100']
-        # ss += 'Energy flux (100 MeV - 100 GeV) : {} +- {} erg cm^-2 s^-1\n'.format(val, err)
-        # ss += 'Detection significance : {}\n'.format(d['Signif_Avg'])
+        ss += "{:<32s} : {:.3} +- {:.3} {}\n".format(
+            "Integral flux (50 GeV - 2 TeV)",
+            d["Flux50"].value,
+            d["Unc_Flux50"].value,
+            "cm-2 s-1",
+        )
+
+        ss += "{:<32s} : {:.3} +- {:.3} {}\n".format(
+            "Energy flux (50 GeV - 2 TeV)",
+            d["Energy_Flux50"].value,
+            d["Unc_Energy_Flux50"].value,
+            "erg cm-2 s-1",
+        )
 
         return ss
 
-    def _get_flux_values(self, prefix, unit='cm-2 s-1'):
-        values = [self.data[prefix + _ + 'GeV'] for _ in self._ebounds_suffix]
-        return u.Quantity(values, unit)
-
     @property
-    def flux_points(self):
-        """Integral flux points (`~gammapy.spectrum.FluxPoints`)."""
-        table = Table()
-        table.meta['SED_TYPE'] = 'flux'
-        table['e_min'] = self._ebounds.lower_bounds
-        table['e_max'] = self._ebounds.upper_bounds
-        table['flux'] = self._get_flux_values('Flux')
-        flux_err = self._get_flux_values('Unc_Flux')
-        table['flux_errn'] = np.abs(flux_err[:, 0])
-        table['flux_errp'] = flux_err[:, 1]
+    def is_pointlike(self):
+        return self.data["Source_Name"].strip()[-1] != "e"
 
-        # handle upper limits
-        is_ul = np.isnan(table['flux_errn'])
-        table['is_ul'] = is_ul
-        table['flux_ul'] = np.nan * flux_err.unit
-        flux_ul = compute_flux_points_ul(table['flux'], table['flux_errp'])
-        table['flux_ul'][is_ul] = flux_ul[is_ul]
+    def spatial_model(self):
+        """Spatial model (`~gammapy.modeling.models.SpatialModel`)."""
+        d = self.data
+        ra = d["RAJ2000"]
+        dec = d["DEJ2000"]
 
-        flux_points = FluxPoints(table)
+        if self.is_pointlike:
+            model = PointSpatialModel(lon_0=ra, lat_0=dec, frame="icrs")
+        else:
+            de = self.data_extended
+            morph_type = de["Model_Form"].strip()
+            e = (1 - (de["Model_SemiMinor"] / de["Model_SemiMajor"]) ** 2.0) ** 0.5
+            sigma = de["Model_SemiMajor"]
+            phi = de["Model_PosAng"]
+            if morph_type in ["Disk", "Elliptical Disk"]:
+                r_0 = de["Model_SemiMajor"]
+                model = DiskSpatialModel(
+                    lon_0=ra, lat_0=dec, r_0=r_0, e=e, phi=phi, frame="icrs"
+                )
+            elif morph_type in ["Map", "Ring", "2D Gaussian x2"]:
+                filename = de["Spatial_Filename"].strip()
+                path = make_path(
+                    "$GAMMAPY_DATA/catalogs/fermi/Extended_archive_v15/Templates/"
+                )
+                return TemplateSpatialModel.read(path / filename)
+            elif morph_type in ["2D Gaussian", "Elliptical 2D Gaussian"]:
+                model = GaussianSpatialModel(
+                    lon_0=ra, lat_0=dec, sigma=sigma, e=e, phi=phi, frame="icrs"
+                )
+            else:
+                raise ValueError(f"Invalid spatial model: {morph_type!r}")
 
-        # TODO: change this and leave it up to the caller to convert to dnde
-        # See https://github.com/gammapy/gammapy/issues/1034
-        return flux_points.to_sed_type('dnde', model=self.spectral_model)
-
-    @property
-    def spectral_model(self):
-        """Best fit spectral model (`~gammapy.spectrum.models.SpectralModel`)."""
-        pars, errs = {}, {}
-        pars['amplitude'] = self.data['Flux50']
-        pars['emin'], pars['emax'] = self.energy_range
-        pars['index'] = self.data['Spectral_Index'] * u.dimensionless_unscaled
-
-        errs['amplitude'] = self.data['Unc_Flux50']
-        errs['index'] = self.data['Unc_Spectral_Index'] * u.dimensionless_unscaled
-
-        model = PowerLaw2(**pars)
-        model.parameters.set_parameter_errors(errs)
+        self._set_spatial_errors(model)
         return model
 
+    def spectral_model(self):
+        """Best fit spectral model (`~gammapy.modeling.models.SpectralModel`)."""
+        tag = "PowerLaw2SpectralModel"
+        pars = {
+            "amplitude": self.data["Flux50"],
+            "emin": self.energy_range[0],
+            "emax": self.energy_range[1],
+            "index": self.data["Spectral_Index"],
+        }
+        errs = {
+            "amplitude": self.data["Unc_Flux50"],
+            "index": self.data["Unc_Spectral_Index"],
+        }
 
-class SourceCatalogObject3FHL(SourceCatalogObject):
+        model = Model.create(tag, "spectral", **pars)
+
+        for name, value in errs.items():
+            model.parameters[name].error = value
+
+        return model
+
+    @property
+    def flux_points_table(self):
+        """Flux points (`~astropy.table.Table`)."""
+        table = Table()
+        table.meta.update(self.flux_points_meta)
+        table["e_min"] = self._energy_edges[:-1]
+        table["e_max"] = self._energy_edges[1:]
+        table["flux"] = self._get_flux_values("Flux")
+        flux_err = self._get_flux_values("Unc_Flux")
+        table["flux_errn"] = np.abs(flux_err[:, 0])
+        table["flux_errp"] = flux_err[:, 1]
+
+        # handle upper limits
+        is_ul = np.isnan(table["flux_errn"])
+        table["is_ul"] = is_ul
+        table["flux_ul"] = np.nan * flux_err.unit
+        flux_ul = compute_flux_points_ul(table["flux"], table["flux_errp"])
+        table["flux_ul"][is_ul] = flux_ul[is_ul]
+        return table
+
+    def _get_flux_values(self, prefix, unit="cm-2 s-1"):
+        values = [self.data[prefix + _ + "GeV"] for _ in self._energy_edges_suffix]
+        return u.Quantity(values, unit)
+
+
+class SourceCatalogObject3FHL(SourceCatalogObjectFermiBase):
     """One source from the Fermi-LAT 3FHL catalog.
 
     Catalog is represented by `~gammapy.catalog.SourceCatalog3FHL`.
     """
-    energy_range = u.Quantity([0.01, 2], 'TeV')
-    """Energy range of the Fermi 1FHL source catalog"""
 
-    _ebounds = EnergyBounds([10, 20, 50, 150, 500, 2000], 'GeV')
+    asso = ["ASSOC1", "ASSOC2", "ASSOC_TEV", "ASSOC_GAM"]
+    energy_range = u.Quantity([0.01, 2], "TeV")
+    """Energy range used for the catalog."""
 
-    def __str__(self):
-        return self.info()
-
-    def info(self, info='all'):
-        """Summary info string.
-
-        Parameters
-        ----------
-        info : {'all', 'basic', 'position', 'spectral'}
-            Comma separated list of options
-        """
-        if info == 'all':
-            info = 'basic,position,spectral,other'
-
-        ss = ''
-        ops = info.split(',')
-        if 'basic' in ops:
-            ss += self._info_basic()
-        if 'position' in ops:
-            ss += self._info_position()
-            if not self.is_pointlike:
-                ss += self._info_morphology()
-        if 'spectral' in ops:
-            ss += self._info_spectral_fit()
-            ss += self._info_spectral_points()
-        if 'other' in ops:
-            ss += self._info_other()
-
-        return ss
-
-    def _info_basic(self):
-        """Print basic info."""
-        d = self.data
-        ss = '\n*** Basic info ***\n\n'
-        ss += 'Catalog row index (zero-based) : {}\n'.format(d['catalog_row_index'])
-        ss += '{:<20s} : {}\n'.format('Source name', d['Source_Name'])
-        ss += '{:<20s} : {}\n'.format('Extended name', d['Extended_Source_Name'])
-
-        def get_nonentry_keys(keys):
-            vals = [d[_].strip() for _ in keys]
-            return ', '.join([_ for _ in vals if _ != ''])
-
-        keys = ['ASSOC1', 'ASSOC2', 'ASSOC_TEV', 'ASSOC_GAM']
-        associations = get_nonentry_keys(keys)
-        ss += '{:<16s} : {}\n'.format('Associations', associations)
-        ss += '{:<16s} : {:.3f}\n'.format('ASSOC_PROB_BAY', d['ASSOC_PROB_BAY'])
-        ss += '{:<16s} : {:.3f}\n'.format('ASSOC_PROB_LR', d['ASSOC_PROB_LR'])
-
-        ss += '{:<16s} : {}\n'.format('Class', d['CLASS'])
-
-        tevcat_flag = d['TEVCAT_FLAG']
-        if tevcat_flag == 'N':
-            tevcat_message = 'No TeV association'
-        elif tevcat_flag == 'P':
-            tevcat_message = 'Small TeV source'
-        elif tevcat_flag == 'E':
-            tevcat_message = 'Extended TeV source (diameter > 40 arcmins)'
-        else:
-            tevcat_message = 'N/A'
-        ss += '{:<16s} : {}\n'.format('TeVCat flag', tevcat_message)
-
-        fmt = '\n{:<32s} : {:.3f}\n'
-        args = ('Significance (10 GeV - 2 TeV)', d['Signif_Avg'])
-        ss += fmt.format(*args)
-        ss += '{:<32s} : {:.1f}\n'.format('Npred', d['Npred'])
-
-        return ss
+    _energy_edges = u.Quantity([10, 20, 50, 150, 500, 2000], "GeV")
 
     def _info_position(self):
-        """Print position info."""
         d = self.data
-        ss = '\n*** Position info ***\n\n'
-        ss += '{:<20s} : {:.3f}\n'.format('RA', d['RAJ2000'])
-        ss += '{:<20s} : {:.3f}\n'.format('DEC', d['DEJ2000'])
-        ss += '{:<20s} : {:.3f}\n'.format('GLON', d['GLON'])
-        ss += '{:<20s} : {:.3f}\n'.format('GLAT', d['GLAT'])
+        ss = "\n*** Position info ***\n\n"
+        ss += "{:<20s} : {:.3f}\n".format("RA", d["RAJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("DEC", d["DEJ2000"])
+        ss += "{:<20s} : {:.3f}\n".format("GLON", d["GLON"])
+        ss += "{:<20s} : {:.3f}\n".format("GLAT", d["GLAT"])
 
         # TODO: All sources are non-elliptical; just give one number for radius?
-        ss += '\n'
-        ss += '{:<20s} : {:.4f}\n'.format('Semimajor (95%)', d['Conf_95_SemiMajor'])
-        ss += '{:<20s} : {:.4f}\n'.format('Semiminor (95%)', d['Conf_95_SemiMinor'])
-        ss += '{:<20s} : {:.2f}\n'.format('Position angle (95%)', d['Conf_95_PosAng'])
-        ss += '{:<20s} : {:.0f}\n'.format('ROI number', d['ROI_num'])
+        ss += "\n"
+        ss += "{:<20s} : {:.4f}\n".format("Semimajor (95%)", d["Conf_95_SemiMajor"])
+        ss += "{:<20s} : {:.4f}\n".format("Semiminor (95%)", d["Conf_95_SemiMinor"])
+        ss += "{:<20s} : {:.2f}\n".format("Position angle (95%)", d["Conf_95_PosAng"])
+        ss += "{:<20s} : {:.0f}\n".format("ROI number", d["ROI_num"])
 
-        return ss
-
-    def _info_morphology(self):
-        e = self.data_extended
-        ss = '*** Extended source information ***\n'
-        ss += '{:<16s} : {}\n'.format('Model form', e['Model_Form'])
-        ss += '{:<16s} : {:.4f}\n'.format('Model semimajor', e['Model_SemiMajor'])
-        ss += '{:<16s} : {:.4f}\n'.format('Model semiminor', e['Model_SemiMinor'])
-        ss += '{:<16s} : {:.4f}\n'.format('Position angle', e['Model_PosAng'])
-        ss += '{:<16s} : {}\n'.format('Spatial function', e['Spatial_Function'])
-        ss += '{:<16s} : {}\n\n'.format('Spatial filename', e['Spatial_Filename'])
         return ss
 
     def _info_spectral_fit(self):
-        """Print model data."""
         d = self.data
-        spec_type = d['SpectrumType'].strip()
+        spec_type = d["SpectrumType"].strip()
 
-        ss = '\n*** Spectral fit info ***\n\n'
+        ss = "\n*** Spectral fit info ***\n\n"
 
-        ss += '{:<32s} : {}\n'.format('Spectrum type', d['SpectrumType'])
-        ss += '{:<32s} : {:.1f}\n'.format('Significance curvature', d['Signif_Curve'])
+        ss += "{:<32s} : {}\n".format("Spectrum type", d["SpectrumType"])
+        ss += "{:<32s} : {:.1f}\n".format("Significance curvature", d["Signif_Curve"])
 
         # Power-law parameters are always given; give in any case
-        fmt = '{:<32s} : {:.3f} +- {:.3f}\n'
-        args = ('Power-law spectral index', d['PowerLaw_Index'], d['Unc_PowerLaw_Index'])
-        ss += fmt.format(*args)
+        fmt = "{:<32s} : {:.3f} +- {:.3f}\n"
+        ss += fmt.format(
+            "Power-law spectral index", d["PowerLaw_Index"], d["Unc_PowerLaw_Index"]
+        )
 
-        if spec_type == 'PowerLaw':
+        if spec_type == "PowerLaw":
             pass
-        elif spec_type == 'LogParabola':
-            fmt = '{:<32s} : {:.3f} +- {:.3f}\n'
-            args = ('LogParabola spectral index', d['Spectral_Index'], d['Unc_Spectral_Index'])
-            ss += fmt.format(*args)
+        elif spec_type == "LogParabola":
+            fmt = "{:<32s} : {:.3f} +- {:.3f}\n"
+            ss += fmt.format(
+                "LogParabolaSpectralModel spectral index",
+                d["Spectral_Index"],
+                d["Unc_Spectral_Index"],
+            )
 
-            ss += '{:<32s} : {:.3f} +- {:.3f}\n'.format('LogParabola beta', d['beta'], d['Unc_beta'])
+            ss += "{:<32s} : {:.3f} +- {:.3f}\n".format(
+                "LogParabolaSpectralModel beta", d["beta"], d["Unc_beta"]
+            )
         else:
-            raise ValueError('This case should not exist. Please report this issue.')
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
 
-        ss += '{:<32s} : {:.1f} {}\n'.format('Pivot energy', d['Pivot_Energy'].value, d['Pivot_Energy'].unit)
+        ss += "{:<32s} : {:.1f} {}\n".format(
+            "Pivot energy", d["Pivot_Energy"].value, d["Pivot_Energy"].unit
+        )
 
-        unit = 'cm-2 GeV-1 s-1'
-        fmt = '{:<32s} : {:.3} +- {:.3} {}\n'
-        args = ('Flux Density at pivot energy', d['Flux_Density'].value, d['Unc_Flux_Density'].value, unit)
-        ss += fmt.format(*args)
+        ss += "{:<32s} : {:.3} +- {:.3} {}\n".format(
+            "Flux Density at pivot energy",
+            d["Flux_Density"].value,
+            d["Unc_Flux_Density"].value,
+            "cm-2 GeV-1 s-1",
+        )
 
-        unit = 'cm-2 s-1'
-        fmt = '{:<32s} : {:.3} +- {:.3} {}\n'
-        args = ('Integral flux (10 GeV - 1 TeV)', d['Flux'].value, d['Unc_Flux'].value, unit)
-        ss += fmt.format(*args)
+        ss += "{:<32s} : {:.3} +- {:.3} {}\n".format(
+            "Integral flux (10 GeV - 1 TeV)",
+            d["Flux"].value,
+            d["Unc_Flux"].value,
+            "cm-2 s-1",
+        )
 
-        unit = 'erg cm-2 s-1'
-        fmt = '{:<32s} : {:.3} +- {:.3} {}\n'
-        args = ('Energy flux (10 GeV - TeV)', d['Energy_Flux'].value, d['Unc_Energy_Flux'].value, unit)
-        ss += fmt.format(*args)
+        ss += "{:<32s} : {:.3} +- {:.3} {}\n".format(
+            "Energy flux (10 GeV - TeV)",
+            d["Energy_Flux"].value,
+            d["Unc_Energy_Flux"].value,
+            "erg cm-2 s-1",
+        )
 
         return ss
 
-    def _info_spectral_points(self):
-        """Print spectral points."""
-        ss = '\n*** Spectral points ***\n\n'
-        lines = self._flux_points_table_formatted.pformat(max_width=-1, max_lines=-1)
-        ss += '\n'.join(lines)
-        return ss + '\n'
-
-    def _info_other(self):
-        """Print other info."""
+    def _info_more(self):
         d = self.data
-        ss = '\n*** Other info ***\n\n'
-        ss += '{:<16s} : {:.3f} {}\n'.format('HEP Energy', d['HEP_Energy'].value, d['HEP_Energy'].unit)
-        ss += '{:<16s} : {:.3f}\n'.format('HEP Probability', d['HEP_Prob'])
+        ss = "\n*** Other info ***\n\n"
 
-        # This is the number of Bayesian blocks for most sources,
-        # except -1 means "could not be tested"
-        msg = d['Variability_BayesBlocks']
-        if msg == 1:
-            msg = '1 (not variable)'
-        elif msg == -1:
-            msg = 'Could not be tested'
-        ss += '{:<16s} : {}\n'.format('Bayesian Blocks', msg)
+        fmt = "{:<32s} : {:.3f}\n"
+        ss += fmt.format("Significance (10 GeV - 2 TeV)", d["Signif_Avg"])
+        ss += "{:<32s} : {:.1f}\n".format("Npred", d["Npred"])
 
-        ss += '{:<16s} : {:.3f}\n'.format('Redshift', d['Redshift'])
-        ss += '{:<16s} : {:.3} {}\n'.format('NuPeak_obs', d['NuPeak_obs'].value, d['NuPeak_obs'].unit)
+        ss += "\n{:<16s} : {:.3f} {}\n".format(
+            "HEP Energy", d["HEP_Energy"].value, d["HEP_Energy"].unit
+        )
+        ss += "{:<16s} : {:.3f}\n".format("HEP Probability", d["HEP_Prob"])
+
+        ss += "{:<16s} : {}\n".format("Bayesian Blocks", d["Variability_BayesBlocks"])
+
+        ss += "{:<16s} : {:.3f}\n".format("Redshift", d["Redshift"])
+        ss += "{:<16s} : {:.3} {}\n".format(
+            "NuPeak_obs", d["NuPeak_obs"].value, d["NuPeak_obs"].unit
+        )
 
         return ss
 
-    @property
     def spectral_model(self):
-        """Best fit spectral model (`~gammapy.spectrum.models.SpectralModel`)."""
+        """Best fit spectral model (`~gammapy.modeling.models.SpectralModel`)."""
         d = self.data
-        spec_type = self.data['SpectrumType'].strip()
+        spec_type = self.data["SpectrumType"].strip()
 
-        pars, errs = {}, {}
-        pars['amplitude'] = d['Flux_Density']
-        errs['amplitude'] = d['Unc_Flux_Density']
-        pars['reference'] = d['Pivot_Energy']
-
-        if spec_type == 'PowerLaw':
-            pars['index'] = d['PowerLaw_Index'] * u.dimensionless_unscaled
-            errs['index'] = d['Unc_PowerLaw_Index'] * u.dimensionless_unscaled
-            model = PowerLaw(**pars)
-        elif spec_type == 'LogParabola':
-            pars['alpha'] = d['Spectral_Index'] * u.dimensionless_unscaled
-            pars['beta'] = d['beta'] * u.dimensionless_unscaled
-            errs['alpha'] = d['Unc_Spectral_Index'] * u.dimensionless_unscaled
-            errs['beta'] = d['Unc_beta'] * u.dimensionless_unscaled
-            model = LogParabola(**pars)
+        if spec_type == "PowerLaw":
+            tag = "PowerLawSpectralModel"
+            pars = {
+                "reference": d["Pivot_Energy"],
+                "amplitude": d["Flux_Density"],
+                "index": d["PowerLaw_Index"],
+            }
+            errs = {
+                "amplitude": d["Unc_Flux_Density"],
+                "index": d["Unc_PowerLaw_Index"],
+            }
+        elif spec_type == "LogParabola":
+            tag = "LogParabolaSpectralModel"
+            pars = {
+                "reference": d["Pivot_Energy"],
+                "amplitude": d["Flux_Density"],
+                "alpha": d["Spectral_Index"],
+                "beta": d["beta"],
+            }
+            errs = {
+                "amplitude": d["Unc_Flux_Density"],
+                "alpha": d["Unc_Spectral_Index"],
+                "beta": d["Unc_beta"],
+            }
         else:
-            raise ValueError('No spec_type: {}. Please report this issue.'.format(spec_type))
+            raise ValueError(f"Invalid spec_type: {spec_type!r}")
 
-        model.parameters.set_parameter_errors(errs)
+        model = Model.create(tag, "spectral", **pars)
+
+        for name, value in errs.items():
+            model.parameters[name].error = value
+
         return model
 
     @property
-    def _flux_points_table_formatted(self):
-        """Returns formatted version of self.flux_points.table"""
-        table = self.flux_points.table.copy()
-        flux_cols = ['flux', 'flux_errn', 'flux_errp', 'e2dnde', 'e2dnde_errn',
-                     'e2dnde_errp', 'flux_ul', 'e2dnde_ul', 'dnde']
-        table['sqrt_ts'].format = '.1f'
-        table['e_ref'].format = '.1f'
-        for _ in flux_cols:
-            table[_].format = '.3'
-
-        return table
-
-    @property
-    def flux_points(self):
-        """Flux points (`~gammapy.spectrum.FluxPoints`)."""
+    def flux_points_table(self):
+        """Flux points (`~astropy.table.Table`)."""
         table = Table()
-        table.meta['SED_TYPE'] = 'flux'
-        e_ref = self._ebounds.log_centers
-        table['e_ref'] = e_ref
-        table['e_min'] = self._ebounds.lower_bounds
-        table['e_max'] = self._ebounds.upper_bounds
+        table.meta.update(self.flux_points_meta)
+        table["e_min"] = self._energy_edges[:-1]
+        table["e_max"] = self._energy_edges[1:]
 
-        flux = self.data['Flux_Band']
-        flux_err = self.data['Unc_Flux_Band']
-        e2dnde = self.data['nuFnu']
+        flux = self.data["Flux_Band"]
+        flux_err = self.data["Unc_Flux_Band"]
+        e2dnde = self.data["nuFnu"]
 
-        table['flux'] = flux
-        table['flux_errn'] = np.abs(flux_err[:, 0])
-        table['flux_errp'] = flux_err[:, 1]
+        table["flux"] = flux
+        table["flux_errn"] = np.abs(flux_err[:, 0])
+        table["flux_errp"] = flux_err[:, 1]
 
-        table['e2dnde'] = e2dnde
-        table['e2dnde_errn'] = np.abs(e2dnde * flux_err[:, 0] / flux)
-        table['e2dnde_errp'] = e2dnde * flux_err[:, 1] / flux
+        table["e2dnde"] = e2dnde
+        table["e2dnde_errn"] = np.abs(e2dnde * flux_err[:, 0] / flux)
+        table["e2dnde_errp"] = e2dnde * flux_err[:, 1] / flux
 
-        is_ul = np.isnan(table['flux_errn'])
-        table['is_ul'] = is_ul
+        is_ul = np.isnan(table["flux_errn"])
+        table["is_ul"] = is_ul
 
         # handle upper limits
-        table['flux_ul'] = np.nan * flux_err.unit
-        flux_ul = compute_flux_points_ul(table['flux'], table['flux_errp'])
-        table['flux_ul'][is_ul] = flux_ul[is_ul]
+        table["flux_ul"] = np.nan * flux_err.unit
+        flux_ul = compute_flux_points_ul(table["flux"], table["flux_errp"])
+        table["flux_ul"][is_ul] = flux_ul[is_ul]
 
-        table['e2dnde_ul'] = np.nan * e2dnde.unit
-        e2dnde_ul = compute_flux_points_ul(table['e2dnde'], table['e2dnde_errp'])
-        table['e2dnde_ul'][is_ul] = e2dnde_ul[is_ul]
+        table["e2dnde_ul"] = np.nan * e2dnde.unit
+        e2dnde_ul = compute_flux_points_ul(table["e2dnde"], table["e2dnde_errp"])
+        table["e2dnde_ul"][is_ul] = e2dnde_ul[is_ul]
 
         # Square root of test statistic
-        table['sqrt_ts'] = self.data['Sqrt_TS_Band']
+        table["sqrt_ts"] = self.data["Sqrt_TS_Band"]
+        return table
 
-        # TODO: remove this computation here.
-        # # Instead provide a method on the FluxPoints class like `to_dnde()` or something.
-        table['dnde'] = (e2dnde * e_ref ** -2).to('cm-2 s-1 TeV-1')
-
-        return FluxPoints(table)
-
-    def spatial_model(self, emin=1 * u.TeV, emax=10 * u.TeV):
-        """
-        Source spatial model.
-        """
+    def spatial_model(self):
+        """Source spatial model (`~gammapy.modeling.models.SpatialModel`)."""
         d = self.data
-        flux = self.spectral_model.integral(emin, emax)
-        amplitude = flux.to('cm-2 s-1').value
-
-        pars = {}
-        glon = Angle(d['GLON']).wrap_at('180d')
-        glat = Angle(d['GLAT']).wrap_at('180d')
+        ra = d["RAJ2000"]
+        dec = d["DEJ2000"]
 
         if self.is_pointlike:
-            pars['amplitude'] = amplitude
-            pars['x_0'] = glon.value
-            pars['y_0'] = glat.value
-            return Delta2D(**pars)
+            model = PointSpatialModel(lon_0=ra, lat_0=dec, frame="icrs")
         else:
             de = self.data_extended
-            morph_type = de['Spatial_Function'].strip()
-
-            if morph_type == 'RadialDisk':
-                pars['x_0'] = glon.value
-                pars['y_0'] = glat.value
-                pars['R_0'] = de['Model_SemiMajor'].to('deg').value
-                pars['amplitude'] = amplitude / (np.pi * pars['R_0'] ** 2)
-                return Disk2D(**pars)
-            elif morph_type == 'SpatialMap':
-                filename = de['Spatial_Filename'].strip()
-                base = '$GAMMAPY_EXTRA/datasets/catalogs/fermi/Extended_archive_v18/Templates/'
-                template = Template2D.read(base + filename)
-                template.amplitude = amplitude
-                return template
-            elif morph_type == 'RadialGauss':
-                pars['x_mean'] = glon.value
-                pars['y_mean'] = glat.value
-                pars['x_stddev'] = de['Model_SemiMajor'].to('deg').value
-                pars['y_stddev'] = de['Model_SemiMajor'].to('deg').value
-                pars['amplitude'] = amplitude * 1 / (2 * np.pi * pars['x_stddev'] ** 2)
-                return Gaussian2D(**pars)
+            morph_type = de["Spatial_Function"].strip()
+            e = (1 - (de["Model_SemiMinor"] / de["Model_SemiMajor"]) ** 2.0) ** 0.5
+            sigma = de["Model_SemiMajor"]
+            phi = de["Model_PosAng"]
+            if morph_type == "RadialDisk":
+                r_0 = de["Model_SemiMajor"]
+                model = DiskSpatialModel(
+                    lon_0=ra, lat_0=dec, r_0=r_0, e=e, phi=phi, frame="icrs"
+                )
+            elif morph_type in ["SpatialMap"]:
+                filename = de["Spatial_Filename"].strip()
+                path = make_path(
+                    "$GAMMAPY_DATA/catalogs/fermi/Extended_archive_v18/Templates/"
+                )
+                model = TemplateSpatialModel.read(path / filename)
+            elif morph_type == "RadialGauss":
+                model = GaussianSpatialModel(
+                    lon_0=ra, lat_0=dec, sigma=sigma, e=e, phi=phi, frame="icrs"
+                )
             else:
-                raise ValueError('Not a valid spatial model{}'.format(morph_type))
-
-    @property
-    def is_pointlike(self):
-        return self.data['Extended_Source_Name'].strip() == ''
+                raise ValueError(f"Invalid morph_type: {morph_type!r}")
+        self._set_spatial_errors(model)
+        return model
 
 
 class SourceCatalog3FGL(SourceCatalog):
     """Fermi-LAT 3FGL source catalog.
 
+    - https://ui.adsabs.harvard.edu/#abs/2015ApJS..218...23A
+    - https://fermi.gsfc.nasa.gov/ssc/data/access/lat/4yr_catalog/
+
     One source is represented by `~gammapy.catalog.SourceCatalogObject3FGL`.
     """
-    name = '3fgl'
-    description = 'LAT 4-year point source catalog'
+
+    tag = "3fgl"
+    description = "LAT 4-year point source catalog"
     source_object_class = SourceCatalogObject3FGL
-    source_categories = {
-        'galactic': ['psr', 'pwn', 'snr', 'spp', 'glc'],
-        'extra-galactic': ['css', 'bll', 'fsrq', 'agn', 'nlsy1',
-                           'rdg', 'sey', 'bcu', 'gal', 'sbg', 'ssrq'],
-        'GALACTIC': ['PSR', 'PWN', 'SNR', 'HMB', 'BIN', 'NOV', 'SFR'],
-        'EXTRA-GALACTIC': ['CSS', 'BLL', 'FSRQ', 'AGN', 'NLSY1',
-                           'RDG', 'SEY', 'BCU', 'GAL', 'SBG', 'SSRQ'],
-        'unassociated': [''],
-    }
 
-    def __init__(self, filename='$GAMMAPY_EXTRA/datasets/catalogs/fermi/gll_psc_v16.fit.gz'):
-        filename = str(make_path(filename))
+    def __init__(self, filename="$GAMMAPY_DATA/catalogs/fermi/gll_psc_v16.fit.gz"):
+        filename = make_path(filename)
 
-        with ignore_warnings():  # ignore FITS units warnings
-            table = Table.read(filename, hdu='LAT_Point_Source_Catalog')
+        with warnings.catch_warnings():  # ignore FITS units warnings
+            warnings.simplefilter("ignore", u.UnitsWarning)
+            table = Table.read(filename, hdu="LAT_Point_Source_Catalog")
+
         table_standardise_units_inplace(table)
 
-        source_name_key = 'Source_Name'
-        source_name_alias = ('Extended_Source_Name', '0FGL_Name', '1FGL_Name',
-                             '2FGL_Name', '1FHL_Name', 'ASSOC_TEV', 'ASSOC1',
-                             'ASSOC2')
-        super(SourceCatalog3FGL, self).__init__(
+        source_name_key = "Source_Name"
+        source_name_alias = (
+            "Extended_Source_Name",
+            "0FGL_Name",
+            "1FGL_Name",
+            "2FGL_Name",
+            "1FHL_Name",
+            "ASSOC_TEV",
+            "ASSOC1",
+            "ASSOC2",
+        )
+        super().__init__(
             table=table,
             source_name_key=source_name_key,
             source_name_alias=source_name_alias,
         )
 
-        self.extended_sources_table = Table.read(filename, hdu='ExtendedSources')
-
-    def is_source_class(self, source_class):
-        """
-        Check if source belongs to a given source class.
-
-        The classes are described in Table 3 of the 3FGL paper:
-
-        http://adsabs.harvard.edu/abs/2015arXiv150102003T
-
-        Parameters
-        ----------
-        source_class : str
-            Source class designator as defined in Table 3. There are a few extra
-            selections available:
-
-            - `'ALL'`: all identified objects
-            - `'all'`: all objects with associations
-            - `'galactic'`: all sources with an associated galactic object
-            - `'GALACTIC'`: all identified galactic sources
-            - `'extra-galactic'`: all sources with an associated extra-galactic object
-            - `'EXTRA-GALACTIC'`: all identified extra-galactic sources
-            - `'unassociated'`: all unassociated objects
-
-        Returns
-        -------
-        selection : `~numpy.ndarray`
-            Selection mask.
-        """
-        source_class_info = np.array([_.strip() for _ in self.table['CLASS1']])
-
-        if source_class in self.source_categories:
-            category = set(self.source_categories[source_class])
-        elif source_class == 'ALL':
-            category = set(self.source_categories['EXTRA-GALACTIC']
-                           + self.source_categories['GALACTIC'])
-        elif source_class == 'all':
-            category = set(self.source_categories['extra-galactic']
-                           + self.source_categories['galactic'])
-        elif source_class in np.unique(source_class_info):
-            category = set(source_class)
-        else:
-            raise ValueError("'{}' ist not a valid source class.".format(source_class))
-
-        selection = np.array([_ in category for _ in source_class_info])
-        return selection
-
-    def select_source_class(self, source_class):
-        """
-        Select all sources of a given source class.
-
-        See `SourceCatalog3FHL.is_source_class` for further documentation
-
-        Parameters
-        ----------
-        source_class : str
-            Source class designator.
-
-        Returns
-        -------
-        selection : `SourceCatalog3FHL`
-            Subset of the 3FHL catalog containing only the selected source class.
-        """
-        catalog = self.copy()
-        selection = self.is_source_class(source_class)
-        catalog.table = catalog.table[selection]
-        return catalog
+        self.extended_sources_table = Table.read(filename, hdu="ExtendedSources")
+        self.hist_table = Table.read(filename, hdu="Hist_Start")
 
 
-class SourceCatalog1FHL(SourceCatalog):
-    """Fermi-LAT 1FHL source catalog.
+class SourceCatalog4FGL(SourceCatalog):
+    """Fermi-LAT 4FGL source catalog.
 
-    One source is represented by `~gammapy.catalog.SourceCatalogObject1FHL`.
+    - https://arxiv.org/abs/1902.10045 (DR1)
+    - https://arxiv.org/abs/2005.11208 (DR2)
+    - https://arxiv.org/abs/2201.11184 (DR3)
+
+    By default we use the file of the DR3 initial release
+    from https://fermi.gsfc.nasa.gov/ssc/data/access/lat/12yr_catalog/
+
+    One source is represented by `~gammapy.catalog.SourceCatalogObject4FGL`.
     """
-    name = '1fhl'
-    description = 'First Fermi-LAT Catalog of Sources above 10 GeV'
-    source_object_class = SourceCatalogObject1FHL
 
-    def __init__(self, filename='$GAMMAPY_EXTRA/datasets/catalogs/fermi/gll_psch_v07.fit.gz'):
-        filename = str(make_path(filename))
+    tag = "4fgl"
+    description = "LAT 8-year point source catalog"
+    source_object_class = SourceCatalogObject4FGL
 
-        with ignore_warnings():  # ignore FITS units warnings
-            table = Table.read(filename, hdu='LAT_Point_Source_Catalog')
+    def __init__(self, filename="$GAMMAPY_DATA/catalogs/fermi/gll_psc_v28.fit.gz"):
+        filename = make_path(filename)
+        table = Table.read(filename, hdu="LAT_Point_Source_Catalog")
         table_standardise_units_inplace(table)
 
-        source_name_key = 'Source_Name'
-        source_name_alias = ('ASSOC1', 'ASSOC2', 'ASSOC_TEV', 'ASSOC_GAM')
-        super(SourceCatalog1FHL, self).__init__(
+        source_name_key = "Source_Name"
+        source_name_alias = (
+            "Extended_Source_Name",
+            "ASSOC_FGL",
+            "ASSOC_FHL",
+            "ASSOC_GAM1",
+            "ASSOC_GAM2",
+            "ASSOC_GAM3",
+            "ASSOC_TEV",
+            "ASSOC1",
+            "ASSOC2",
+        )
+        super().__init__(
             table=table,
             source_name_key=source_name_key,
             source_name_alias=source_name_alias,
         )
 
-        self.extended_sources_table = Table.read(filename, hdu='ExtendedSources')
+        self.extended_sources_table = Table.read(filename, hdu="ExtendedSources")
+        try:
+            self.hist_table = Table.read(filename, hdu="Hist_Start")
+            if "MJDREFI" not in self.hist_table.meta:
+                self.hist_table.meta = Table.read(filename, hdu="GTI").meta
+        except KeyError:
+            pass
+        try:
+            self.hist2_table = Table.read(filename, hdu="Hist2_Start")
+            if "MJDREFI" not in self.hist_table.meta:
+                self.hist2_table.meta = Table.read(filename, hdu="GTI").meta
+        except KeyError:
+            pass
+
+        table = Table.read(filename, hdu="EnergyBounds")
+        self.flux_points_energy_edges = np.unique(
+            np.c_[table["LowerEnergy"].quantity, table["UpperEnergy"].quantity]
+        )
 
 
 class SourceCatalog2FHL(SourceCatalog):
     """Fermi-LAT 2FHL source catalog.
 
+    - https://ui.adsabs.harvard.edu/abs/2016ApJS..222....5A
+    - https://fermi.gsfc.nasa.gov/ssc/data/access/lat/2FHL/
+
     One source is represented by `~gammapy.catalog.SourceCatalogObject2FHL`.
     """
-    name = '2fhl'
-    description = 'LAT second high-energy source catalog'
+
+    tag = "2fhl"
+    description = "LAT second high-energy source catalog"
     source_object_class = SourceCatalogObject2FHL
 
-    def __init__(self, filename='$GAMMAPY_EXTRA/datasets/catalogs/fermi/gll_psch_v08.fit.gz'):
-        filename = str(make_path(filename))
+    def __init__(self, filename="$GAMMAPY_DATA/catalogs/fermi/gll_psch_v09.fit.gz"):
+        filename = make_path(filename)
 
-        with ignore_warnings():  # ignore FITS units warnings
-            table = Table.read(filename, hdu='2FHL Source Catalog')
+        with warnings.catch_warnings():  # ignore FITS units warnings
+            warnings.simplefilter("ignore", u.UnitsWarning)
+            table = Table.read(filename, hdu="2FHL Source Catalog")
+
         table_standardise_units_inplace(table)
 
-        source_name_key = 'Source_Name'
-        source_name_alias = ('ASSOC', '3FGL_Name', '1FHL_Name', 'TeVCat_Name')
-        super(SourceCatalog2FHL, self).__init__(
+        source_name_key = "Source_Name"
+        source_name_alias = ("ASSOC", "3FGL_Name", "1FHL_Name", "TeVCat_Name")
+        super().__init__(
             table=table,
             source_name_key=source_name_key,
             source_name_alias=source_name_alias,
         )
 
-        self.counts_image = SkyImage.read(filename, hdu='Count Map')
-        self.extended_sources_table = Table.read(filename, hdu='Extended Sources')
-        self.rois = Table.read(filename, hdu='ROIs')
+        self.extended_sources_table = Table.read(filename, hdu="Extended Sources")
+        self.rois = Table.read(filename, hdu="ROIs")
 
 
 class SourceCatalog3FHL(SourceCatalog):
     """Fermi-LAT 3FHL source catalog.
 
+    - https://ui.adsabs.harvard.edu/abs/2017ApJS..232...18A
+    - https://fermi.gsfc.nasa.gov/ssc/data/access/lat/3FHL/
+
     One source is represented by `~gammapy.catalog.SourceCatalogObject3FHL`.
     """
-    name = '3fhl'
-    description = 'LAT third high-energy source catalog'
+
+    tag = "3fhl"
+    description = "LAT third high-energy source catalog"
     source_object_class = SourceCatalogObject3FHL
-    source_categories = {
-        'galactic': ['glc', 'hmb', 'psr', 'pwn', 'sfr', 'snr', 'spp'],
-        'extra-galactic': ['agn', 'bcu', 'bll', 'fsrq', 'rdg', 'sbg'],
-        'GALACTIC': ['BIN', 'HMB', 'PSR', 'PWN', 'SFR', 'SNR'],
-        'EXTRA-GALACTIC': ['BLL', 'FSRQ', 'NLSY1', 'RDG'],
-        'unassociated': [''],
-    }
 
-    def __init__(self, filename='$GAMMAPY_EXTRA/datasets/catalogs/fermi/gll_psch_v13.fit.gz'):
-        filename = str(make_path(filename))
+    def __init__(self, filename="$GAMMAPY_DATA/catalogs/fermi/gll_psch_v13.fit.gz"):
+        filename = make_path(filename)
 
-        with ignore_warnings():  # ignore FITS units warnings
-            table = Table.read(filename, hdu='LAT_Point_Source_Catalog')
+        with warnings.catch_warnings():  # ignore FITS units warnings
+            warnings.simplefilter("ignore", u.UnitsWarning)
+            table = Table.read(filename, hdu="LAT_Point_Source_Catalog")
+
         table_standardise_units_inplace(table)
 
-        source_name_key = 'Source_Name'
-        source_name_alias = ('ASSOC1', 'ASSOC2', 'ASSOC_TEV', 'ASSOC_GAM')
-        super(SourceCatalog3FHL, self).__init__(
+        source_name_key = "Source_Name"
+        source_name_alias = ("ASSOC1", "ASSOC2", "ASSOC_TEV", "ASSOC_GAM")
+        super().__init__(
             table=table,
             source_name_key=source_name_key,
             source_name_alias=source_name_alias,
         )
 
-        self.extended_sources_table = Table.read(filename, hdu='ExtendedSources')
-        self.rois = Table.read(filename, hdu='ROIs')
-        self.energy_bounds_table = Table.read(filename, hdu='EnergyBounds')
-
-    def is_source_class(self, source_class):
-        """
-        Check if source belongs to a given source class.
-
-        The classes are described in Table 3 of the 3FGL paper:
-
-        http://adsabs.harvard.edu/abs/2015arXiv150102003T
-
-        Parameters
-        ----------
-        source_class : str
-            Source class designator as defined in Table 3. There are a few extra
-            selections available:
-
-            - `'ALL'`: all identified objects
-            - `'all'`: all objects with associations
-            - `'galactic'`: all sources with an associated galactic object
-            - `'GALACTIC'`: all identified galactic sources
-            - `'extra-galactic'`: all sources with an associated extra-galactic object
-            - `'EXTRA-GALACTIC'`: all identified extra-galactic sources
-            - `'unassociated'`: all unassociated objects
-
-        Returns
-        -------
-        selection : `~numpy.ndarray`
-            Selection mask.
-        """
-        source_class_info = np.array([_.strip() for _ in self.table['CLASS']])
-
-        if source_class in self.source_categories:
-            category = set(self.source_categories[source_class])
-        elif source_class == 'ALL':
-            category = set(self.source_categories['EXTRA-GALACTIC']
-                           + self.source_categories['GALACTIC'])
-        elif source_class == 'all':
-            category = set(self.source_categories['extra-galactic']
-                           + self.source_categories['galactic'])
-        elif source_class in np.unique(source_class_info):
-            category = set(source_class)
-        else:
-            raise ValueError("'{}' ist not a valid source class.".format(source_class))
-
-        selection = np.array([_ in category for _ in source_class_info])
-        return selection
-
-    def select_source_class(self, source_class):
-        """
-        Select all sources of a given source class.
-
-        See `SourceCatalog3FHL.is_source_class` for further documentation
-
-        Parameters
-        ----------
-        source_class : str
-            Source class designator.
-
-        Returns
-        -------
-        selection : `SourceCatalog3FHL`
-            Subset of the 3FHL catalog containing only the selected source class.
-        """
-        catalog = self.copy()
-        selection = self.is_source_class(source_class)
-        catalog.table = catalog.table[selection]
-        return catalog
+        self.extended_sources_table = Table.read(filename, hdu="ExtendedSources")
+        self.rois = Table.read(filename, hdu="ROIs")
+        self.energy_bounds_table = Table.read(filename, hdu="EnergyBounds")

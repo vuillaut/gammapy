@@ -1,20 +1,29 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-"""
-Maps (2D and 3D).
+"""Sky maps."""
+from .axes import LabelMapAxis, MapAxes, MapAxis, TimeMapAxis
+from .coord import MapCoord
+from .core import Map
+from .geom import Geom
+from .hpx import HpxGeom, HpxMap, HpxNDMap
+from .maps import Maps
+from .region import RegionGeom, RegionNDMap
+from .wcs import WcsGeom, WcsMap, WcsNDMap
 
-This is work in progress, we're prototyping.
-
-* Names and API might change.
-* Not mentioned to users in the HTML docs at this point
-* Contributions and feedback welcome!
-"""
-from .base import *
-from .geom import *
-from .hpx import *
-from .hpxnd import *
-from .hpxsparse import *
-from .hpxmap import *
-from .wcs import *
-from .wcsnd import *
-from .wcsmap import *
-from .sparse import *
+__all__ = [
+    "Geom",
+    "HpxGeom",
+    "HpxMap",
+    "HpxNDMap",
+    "LabelMapAxis",
+    "Map",
+    "MapAxes",
+    "MapAxis",
+    "MapCoord",
+    "Maps",
+    "RegionGeom",
+    "RegionNDMap",
+    "TimeMapAxis",
+    "WcsGeom",
+    "WcsMap",
+    "WcsNDMap",
+]

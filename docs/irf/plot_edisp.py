@@ -1,15 +1,8 @@
-"""Plot energy dispersion example."""
+"""Plot an energy dispersion from the HESS DL3 data release 1."""
 import matplotlib.pyplot as plt
-import astropy.units as u
-import numpy as np
-from gammapy.irf import EnergyDispersion
+from gammapy.irf import EnergyDispersion2D
 
-ebounds = np.logspace(-1, 2, 101) * u.TeV
-
-edisp = EnergyDispersion.from_gauss(
-    e_true=ebounds, e_reco=ebounds,
-    bias=0, sigma=0.3,
-)
-
+filename = "$GAMMAPY_DATA/hess-dl3-dr1/data/hess_dl3_dr1_obs_id_020136.fits.gz"
+edisp = EnergyDispersion2D.read(filename, hdu="EDISP")
 edisp.peek()
 plt.show()

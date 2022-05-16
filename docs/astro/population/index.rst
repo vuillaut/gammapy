@@ -1,8 +1,8 @@
 .. _astro-population:
 
-*******************************************************************
-Astrophysical source population models (`gammapy.astro.population`)
-*******************************************************************
+**************************************
+Astrophysical source population models
+**************************************
 
 .. currentmodule:: gammapy.astro.population
 
@@ -13,13 +13,13 @@ The `gammapy.astro.population` module provides a simple framework for population
 synthesis of gamma-ray sources, which is useful in the context of surveys and
 population studies.
 
-Getting Started
+Getting started
 ===============
 
 The following example illustrates how to simulate a basic catalog including a
 spiral arm model.
 
-.. code-block:: python
+.. testcode::
 
     import astropy.units as u
     from gammapy.astro.population import make_base_catalog_galactic
@@ -50,14 +50,15 @@ surface density of pulsars and related objects used in literature:
 
 .. plot:: astro/population/plot_radial_distributions.py
 
-TODO: add illustration of Galactocentric z-distribution model and combined
-(r, z) distribution for the Besancon model.
+TODO: add illustration of Galactocentric z-distribution model and combined (r,
+z) distribution for the Besancon model.
 
 Spiral arm models
 -----------------
 
 Two spiral arm models of the Milky way are available:
-(`~gammapy.astro.population.ValleeSpiral` and `gammapy.astro.population.FaucherSpiral`)
+`~gammapy.astro.population.ValleeSpiral` and
+`gammapy.astro.population.FaucherSpiral`
 
 .. plot:: astro/population/plot_spiral_arm_models.py
 
@@ -68,10 +69,3 @@ Velocity distributions
 Here is a comparison plot of all available velocity distribution functions:
 
 .. plot:: astro/population/plot_velocity_distributions.py
-
-Reference/API
-=============
-
-.. automodapi:: gammapy.astro.population
-    :no-inheritance-diagram:
-    :include-all-objects:

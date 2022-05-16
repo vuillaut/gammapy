@@ -1,27 +1,21 @@
 include README.rst
 include LONG_DESCRIPTION.rst
 include CHANGES.rst
-include gammapy-conda-install.sh
-include gammapy/tests/coveragerc
+include environment-dev.yml
 
-include ez_setup.py
-include ah_bootstrap.py
 include setup.cfg
+include pyproject.toml
 
 recursive-include gammapy *.pyx *.pxd *.c *.h
 recursive-include docs *
 recursive-include licenses *
-recursive-include cextern *
-recursive-include scripts *
 recursive-include examples *
 recursive-include dev *
 
 prune build
 prune docs/_build
 prune docs/api
-
-recursive-include astropy_helpers *
-exclude astropy_helpers/.git
-exclude astropy_helpers/.gitignore
+prune docs/notebooks
+prune docs/_static/notebooks
 
 global-exclude *.pyc *.o

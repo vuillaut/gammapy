@@ -7,6 +7,5 @@ the `gammapy.utils` namespace is empty.
 
 Examples::
 
-    from gammapy.utils.modeling import Parameter
-    from gammapy.utils.nddata import NDDataArray
+    from gammapy.utils.interpolation import ScaledRegularGridInterpolator
 """

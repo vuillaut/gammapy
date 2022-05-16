@@ -1,26 +1,22 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
-import sys
+from collections import namedtuple
 import numpy as np
-from astropy.table import Table
-from astropy.units import Quantity
 from astropy.coordinates import Angle, SkyCoord
-from astropy.time import Time
+from astropy.table import Table
+from astropy.units import Quantity, Unit
 from astropy.utils import lazyproperty
-from ..utils.scripts import make_path
-from ..utils.time import time_relative_to_ref
+from gammapy.utils.regions import SphericalCircleSkyRegion
+from gammapy.utils.scripts import make_path
+from gammapy.utils.testing import Checker
+from gammapy.utils.time import time_ref_from_dict
 
-__all__ = [
-    'ObservationTable',
-]
+__all__ = ["ObservationTable"]
 
 
 class ObservationTable(Table):
     """Observation table.
 
-    This is an `~astropy.table.Table` sub-class, with a few
-    convenience methods. The format of the observation table
-    is described in :ref:`dataformats_observation_lists`.
+    Data format specification: :ref:`gadf:obs-index`
     """
 
     @classmethod
@@ -29,27 +25,43 @@ class ObservationTable(Table):
 
         Parameters
         ----------
-        filename : `~gammapy.extern.pathlib.Path`, str
+        filename : `pathlib.Path`, str
             Filename
         """
-        filename = make_path(filename)
-        return super(ObservationTable, cls).read(str(filename), **kwargs)
+        return super().read(make_path(filename), **kwargs)
 
     @property
     def pointing_radec(self):
-        """Pointing positions as ICRS (`~astropy.coordinates.SkyCoord`)"""
-        return SkyCoord(self['RA_PNT'], self['DEC_PNT'], unit='deg', frame='icrs')
+        """Pointing positions as ICRS (`~astropy.coordinates.SkyCoord`)."""
+        return SkyCoord(self["RA_PNT"], self["DEC_PNT"], unit="deg", frame="icrs")
 
     @property
     def pointing_galactic(self):
-        """Pointing positions as Galactic (`~astropy.coordinates.SkyCoord`)"""
-        return SkyCoord(self['GLON_PNT'], self['GLAT_PNT'], unit='deg', frame='galactic')
+        """Pointing positions as Galactic (`~astropy.coordinates.SkyCoord`)."""
+        return SkyCoord(
+            self["GLON_PNT"], self["GLAT_PNT"], unit="deg", frame="galactic"
+        )
+
+    @property
+    def time_ref(self):
+        """Time reference (`~astropy.time.Time`)."""
+        return time_ref_from_dict(self.meta)
+
+    @property
+    def time_start(self):
+        """Observation start time (`~astropy.time.Time`)."""
+        return self.time_ref + Quantity(self["TSTART"], "second")
+
+    @property
+    def time_stop(self):
+        """Observation stop time (`~astropy.time.Time`)."""
+        return self.time_ref + Quantity(self["TSTOP"], "second")
 
     @lazyproperty
     def _index_dict(self):
-        """Dict containing row index for all obs ids"""
+        """Dict containing row index for all obs ids."""
         # TODO: Switch to http://docs.astropy.org/en/latest/table/indexing.html once it is more stable
-        temp = (zip(self['OBS_ID'], np.arange(len(self))))
+        temp = zip(self["OBS_ID"], np.arange(len(self)))
         return dict(temp)
 
     def get_obs_idx(self, obs_id):
@@ -82,53 +94,14 @@ class ObservationTable(Table):
         """
         return self[self.get_obs_idx(obs_id)]
 
-    def summary(self, file=None):
-        """Info string (str)"""
-        if not file:
-            file = sys.stdout
-
-        print('Observation table:', file=file)
-
-        if 'OBSERVATORY_NAME' in self.meta:
-            obs_name = self.meta['OBSERVATORY_NAME']
-            print('Observatory name: {}'.format(obs_name), file=file)
-
-        print('Number of observations: {}'.format(len(self)), file=file)
-
-        # TODO: clean this up. Make those properties?
-        # ontime = Quantity(self['ONTIME'].sum(), self['ONTIME'].unit)
-        #
-        # ss += 'Total observation time: {}\n'.format(ontime)
-        # livetime = Quantity(self['LIVETIME'].sum(), self['LIVETIME'].unit)
-        # ss += 'Total live time: {}\n'.format(livetime)
-        # dtf = 100. * (1 - livetime / ontime)
-        # ss += 'Average dead time fraction: {:5.2f}%\n'.format(dtf)
-        # time_ref = time_ref_from_dict(self.meta)
-        # time_ref_unit = time_ref_from_dict(self.meta).format
-        # ss += 'Time reference: {} {}'.format(time_ref, time_ref_unit)
-        #
-        # return ss
-
-    def select_linspace_subset(self, num):
-        """Select subset of observations.
-
-        This is mostly useful for testing, if you want to make
-        the analysis run faster.
-
-        Parameters
-        ----------
-        num : int
-            Number of samples to select.
-
-        Returns
-        -------
-        table : `ObservationTable`
-            Subset observation table (a copy).
-        """
-        indices = np.linspace(start=0, stop=len(self), num=num, endpoint=False)
-        # Round down to nearest integer
-        indices = indices.astype('int')
-        return self[indices]
+    def summary(self):
+        """Summary info string (str)."""
+        obs_name = self.meta.get("OBSERVATORY_NAME", "N/A")
+        return (
+            f"Observation table:\n"
+            f"Observatory name: {obs_name!r}\n"
+            f"Number of observations: {len(self)}\n"
+        )
 
     def select_range(self, selection_variable, value_range, inverted=False):
         """Make an observation table, applying some selection.
@@ -168,30 +141,29 @@ class ObservationTable(Table):
         mask = (value_range[0] <= value) & (value < value_range[1])
 
         if np.allclose(value_range[0].value, value_range[1].value):
-            mask = (value_range[0] == value)
+            mask = value_range[0] == value
 
         if inverted:
             mask = np.invert(mask)
 
         return self[mask]
 
-    def select_time_range(self, selection_variable, time_range, inverted=False):
+    def select_time_range(self, time_range, partial_overlap=False, inverted=False):
         """Make an observation table, applying a time selection.
 
         Apply a 1D box selection (min, max) to a
         table on any time variable that is in the observation table.
-        It supports both fomats: absolute times in
-        `~astropy.time.Time` variables and [MET]_.
+        It supports absolute times in `~astropy.time.Time` format.
 
         If the inverted flag is activated, the selection is applied to
         keep all elements outside the selected range.
 
         Parameters
         ----------
-        selection_variable : str
-            Name of variable to apply a cut (it should exist on the table).
         time_range : `~astropy.time.Time`
             Allowed time range (min, max).
+        partial_overlap : bool, optional
+            Include partially overlapping observations. Default is False
         inverted : bool, optional
             Invert selection: keep all entries outside the (min, max) range.
 
@@ -200,31 +172,62 @@ class ObservationTable(Table):
         obs_table : `~gammapy.data.ObservationTable`
             Observation table after selection.
         """
-        if self.meta['TIME_FORMAT'] == 'absolute':
-            # read times into a Time object
-            time = Time(self[selection_variable])
-        else:
-            # transform time to MET
-            time_range = time_relative_to_ref(time_range, self.meta)
-            # read values into a quantity in case units have to be taken into account
-            time = Quantity(self[selection_variable])
+        tstart = self.time_start
+        tstop = self.time_stop
 
-        mask = (time_range[0] <= time) & (time < time_range[1])
+        if not partial_overlap:
+            mask1 = time_range[0] <= tstart
+            mask2 = time_range[1] >= tstop
+        else:
+            mask1 = time_range[0] <= tstop
+            mask2 = time_range[1] >= tstart
+
+        mask = mask1 & mask2
 
         if inverted:
             mask = np.invert(mask)
 
         return self[mask]
 
-    def select_observations(self, selection=None):
-        """Select subset of observations.
+    def select_sky_circle(self, center, radius, inverted=False):
+        """Make an observation table, applying a cone selection.
+
+        Apply a selection based on the separation between the cone center
+        and the observation pointing stored in the table.
+
+        If the inverted flag is activated, the selection is applied to
+        keep all elements outside the selected range.
+
+        Parameters
+        ----------
+        center : `~astropy.coordinate.SkyCoord`
+            Cone center coordinate.
+        radius : `~astropy.coordinate.Angle`
+            Cone opening angle. The maximal separation allowed between the center and the observation
+            pointing direction.
+        inverted : bool, optional
+            Invert selection: keep all entries outside the cone.
+
+        Returns
+        -------
+        obs_table : `~gammapy.data.ObservationTable`
+            Observation table after selection.
+        """
+        region = SphericalCircleSkyRegion(center=center, radius=radius)
+        mask = region.contains(self.pointing_radec)
+        if inverted:
+            mask = np.invert(mask)
+        return self[mask]
+
+    def select_observations(self, selections=None):
+        """Select subset of observations from a list of selection criteria.
 
         Returns a new observation table representing the subset.
 
         There are 3 main kinds of selection criteria, according to the
         value of the **type** keyword in the **selection** dictionary:
 
-        - sky regions (boxes or circles)
+        - circular region
 
         - time intervals (min, max)
 
@@ -235,21 +238,8 @@ class ObservationTable(Table):
         Allowed selection criteria are interpreted using the following
         keywords in the **selection** dictionary under the **type** key.
 
-        - ``sky_box`` and ``sky_circle`` are 2D selection criteria acting
-          on sky coordinates
-
-            - ``sky_box`` is a squared region delimited by the **lon** and
-              **lat** keywords: both tuples of format (min, max); uses
-              `~gammapy.catalog.select_sky_box`
-
-            - ``sky_circle`` is a circular region centered in the coordinate
-              marked by the **lon** and **lat** keywords, and radius **radius**;
-              uses `~gammapy.catalog.select_sky_circle`
-
-          in each case, the coordinate system can be specified by the **frame**
-          keyword (built-in Astropy coordinate frames are supported, e.g.
-          ``icrs`` or ``galactic``); an aditional border can be defined using
-          the **border** keyword
+        - ``sky_circle`` is a circular region centered in the coordinate
+           marked by the **lon** and **lat** keywords, and radius **radius**
 
         - ``time_box`` is a 1D selection criterion acting on the observation
           start time (**TSTART**); the interval is set via the
@@ -272,8 +262,8 @@ class ObservationTable(Table):
 
         Parameters
         ----------
-        selection : dict
-            Dictionary with a few keywords for applying selection cuts.
+        selection : list of dict
+            List of selection cuts dictionaries.
 
         Returns
         -------
@@ -282,12 +272,9 @@ class ObservationTable(Table):
 
         Examples
         --------
-        >>> selection = dict(type='sky_box', frame='icrs',
-        ...                  lon=Angle([150, 300], 'deg'),
-        ...                  lat=Angle([-50, 0], 'deg'),
-        ...                  border=Angle(2, 'deg'))
-        >>> selected_obs_table = obs_table.select_observations(selection)
-
+        >>> from gammapy.data import ObservationTable
+        >>> obs_table = ObservationTable.read('$GAMMAPY_DATA/hess-dl3-dr1/obs-index.fits.gz')
+        >>> from astropy.coordinates import Angle
         >>> selection = dict(type='sky_circle', frame='galactic',
         ...                  lon=Angle(0, 'deg'),
         ...                  lat=Angle(0, 'deg'),
@@ -295,56 +282,130 @@ class ObservationTable(Table):
         ...                  border=Angle(2, 'deg'))
         >>> selected_obs_table = obs_table.select_observations(selection)
 
-        >>> selection = dict(type='time_box',
-        ...                  time_range=Time(['2012-01-01T01:00:00', '2012-01-01T02:00:00']))
+        >>> from astropy.time import Time
+        >>> selection = dict(type='time_box', time_range=Time(['2012-01-01T01:00:00', '2012-01-01T02:00:00']))
         >>> selected_obs_table = obs_table.select_observations(selection)
 
-        >>> selection = dict(type='par_box', variable='ALT',
-        ...                  value_range=Angle([60., 70.], 'deg'))
+        >>> selection = dict(type='par_box', variable='ALT_PNT', value_range=Angle([60., 70.], 'deg'))
         >>> selected_obs_table = obs_table.select_observations(selection)
 
-        >>> selection = dict(type='par_box', variable='OBS_ID',
-        ...                  value_range=[2, 5])
+        >>> selection = dict(type='par_box', variable='OBS_ID', value_range=[2, 5])
         >>> selected_obs_table = obs_table.select_observations(selection)
 
-        >>> selection = dict(type='par_box', variable='N_TELS',
-        ...                  value_range=[4, 4])
+        >>> selection = dict(type='par_box', variable='N_TELS', value_range=[4, 4])
         >>> selected_obs_table = obs_table.select_observations(selection)
         """
-        from ..catalog import select_sky_box, select_sky_circle
+        if isinstance(selections, dict):
+            selections = [selections]
 
-        if 'inverted' not in selection.keys():
-            selection['inverted'] = False
+        obs_table = self
+        for selection in selections:
+            obs_table = obs_table._apply_simple_selection(selection)
 
-        if selection['type'] == 'sky_circle':
-            lon = selection['lon']
-            lat = selection['lat']
-            radius = selection['radius'] + selection['border']
-            return select_sky_circle(
-                self, lon_cen=lon, lat_cen=lat, radius=radius,
-                frame=selection['frame'], inverted=selection['inverted']
-            )
+        return obs_table
 
-        elif selection['type'] == 'sky_box':
-            lon = selection['lon']
-            lat = selection['lat']
-            border = selection['border']
-            lon = Angle([lon[0] - border, lon[1] + border])
-            lat = Angle([lat[0] - border, lat[1] + border])
-            return select_sky_box(
-                self, lon_lim=lon, lat_lim=lat,
-                frame=selection['frame'], inverted=selection['inverted']
-            )
-
-        elif selection['type'] == 'time_box':
-            return self.select_time_range(
-                'TSTART', selection['time_range'], selection['inverted']
-            )
-
-        elif selection['type'] == 'par_box':
-            return self.select_range(
-                selection['variable'], selection['value_range'], selection['inverted']
-            )
-
+    def _apply_simple_selection(self, selection):
+        """Select subset of observations from a single selection criterion."""
+        selection = selection.copy()
+        type = selection.pop("type")
+        if type == "sky_circle":
+            lon = Angle(selection.pop("lon"), "deg")
+            lat = Angle(selection.pop("lat"), "deg")
+            radius = Angle(selection.pop("radius"), "deg")
+            radius += Angle(selection.pop("border", 0), "deg")
+            center = SkyCoord(lon, lat, frame=selection.pop("frame"))
+            return self.select_sky_circle(center, radius, **selection)
+        elif type == "time_box":
+            time_range = selection.pop("time_range")
+            return self.select_time_range(time_range, **selection)
+        elif type == "par_box":
+            variable = selection.pop("variable")
+            return self.select_range(variable, **selection)
         else:
-            raise ValueError('Invalid selection type: {}'.format(selection['type']))
+            raise ValueError(f"Invalid selection type: {type}")
+
+
+class ObservationTableChecker(Checker):
+    """Event list checker.
+
+    Data format specification: ref:`gadf:iact-events`
+
+    Parameters
+    ----------
+    event_list : `~gammapy.data.EventList`
+        Event list
+    """
+
+    CHECKS = {
+        "meta": "check_meta",
+        "columns": "check_columns",
+        # "times": "check_times",
+        # "coordinates_galactic": "check_coordinates_galactic",
+        # "coordinates_altaz": "check_coordinates_altaz",
+    }
+
+    # accuracy = {"angle": Angle("1 arcsec"), "time": Quantity(1, "microsecond")}
+
+    # https://gamma-astro-data-formats.readthedocs.io/en/latest/events/events.html#mandatory-header-keywords
+    meta_required = [
+        "HDUCLASS",
+        "HDUDOC",
+        "HDUVERS",
+        "HDUCLAS1",
+        "HDUCLAS2",
+        # https://gamma-astro-data-formats.readthedocs.io/en/latest/general/time.html#time-formats
+        "MJDREFI",
+        "MJDREFF",
+        "TIMEUNIT",
+        "TIMESYS",
+        "TIMEREF",
+        # https://gamma-astro-data-formats.readthedocs.io/en/latest/general/coordinates.html#coords-location
+        "GEOLON",
+        "GEOLAT",
+        "ALTITUDE",
+    ]
+
+    _col = namedtuple("col", ["name", "unit"])
+    columns_required = [
+        _col(name="OBS_ID", unit=""),
+        _col(name="RA_PNT", unit="deg"),
+        _col(name="DEC_PNT", unit="deg"),
+        _col(name="TSTART", unit="s"),
+        _col(name="TSTOP", unit="s"),
+    ]
+
+    def __init__(self, obs_table):
+        self.obs_table = obs_table
+
+    @staticmethod
+    def _record(level="info", msg=None):
+        return {"level": level, "hdu": "obs-index", "msg": msg}
+
+    def check_meta(self):
+        m = self.obs_table.meta
+
+        meta_missing = sorted(set(self.meta_required) - set(m))
+        if meta_missing:
+            yield self._record(
+                level="error", msg=f"Missing meta keys: {meta_missing!r}"
+            )
+
+        if m.get("HDUCLAS1", "") != "INDEX":
+            yield self._record(level="error", msg="HDUCLAS1 must be INDEX")
+        if m.get("HDUCLAS2", "") != "OBS":
+            yield self._record(level="error", msg="HDUCLAS2 must be OBS")
+
+    def check_columns(self):
+        t = self.obs_table
+
+        if len(t) == 0:
+            yield self._record(level="error", msg="Observation table has zero rows")
+
+        for name, unit in self.columns_required:
+            if name not in t.colnames:
+                yield self._record(level="error", msg=f"Missing table column: {name!r}")
+            else:
+                if Unit(unit) != (t[name].unit or ""):
+                    yield self._record(
+                        level="error", msg=f"Invalid unit for column: {name!r}"
+                    )

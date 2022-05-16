@@ -1,112 +1,115 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
-import numpy as np
-from numpy.testing import assert_allclose, assert_equal
-from astropy.tests.helper import assert_quantity_allclose
+import logging
+import os
+from pathlib import Path
 import pytest
-from astropy.coordinates import Angle, SkyCoord
-from astropy.units import Quantity
+import numpy as np
 import astropy.units as u
-from astropy.time import Time
-from ...data import DataStore, DataManager, ObservationList
-from ...utils.testing import data_manager, requires_data, requires_dependency
-from ...utils.testing import assert_time_allclose, assert_skycoord_allclose
-from ...utils.energy import Energy
-from ...datasets import gammapy_extra
-from ...utils.energy import EnergyBounds
+from astropy.io import fits
+from gammapy.data import DataStore
+from gammapy.utils.scripts import make_path
+from gammapy.utils.testing import requires_data
 
 
-@requires_dependency('scipy')
-@requires_data('gammapy-extra')
-def test_datastore_hd_hap():
+@pytest.fixture()
+def data_store():
+    return DataStore.from_dir("$GAMMAPY_DATA/hess-dl3-dr1/")
+
+
+@requires_data()
+def test_datastore_hd_hap(data_store):
     """Test HESS HAP-HD data access."""
-    data_store = DataStore.from_dir('$GAMMAPY_EXTRA/datasets/hess-crab4-hd-hap-prod2')
-
     obs = data_store.obs(obs_id=23523)
 
-    assert str(type((obs.events))) == "<class 'gammapy.data.event_list.EventList'>"
-    assert str(type(obs.gti)) == "<class 'gammapy.data.gti.GTI'>"
-    assert str(type(obs.aeff)) == "<class 'gammapy.irf.effective_area.EffectiveAreaTable2D'>"
-    assert str(type(obs.edisp)) == "<class 'gammapy.irf.energy_dispersion.EnergyDispersion2D'>"
-    assert str(type(obs.psf)) == "<class 'gammapy.irf.psf_analytical.EnergyDependentMultiGaussPSF'>"
-    # TODO: no background model available yet
-    # assert str(type(obs.bkg)) == ""
+    assert obs.events.__class__.__name__ == "EventList"
+    assert obs.gti.__class__.__name__ == "GTI"
+    assert obs.aeff.__class__.__name__ == "EffectiveAreaTable2D"
+    assert obs.edisp.__class__.__name__ == "EnergyDispersion2D"
+    assert obs.psf.__class__.__name__ == "PSF3D"
 
 
-@requires_dependency('scipy')
-@requires_data('gammapy-extra')
-def test_datastore_pa():
-    """Test HESS ParisAnalysis data access."""
-    data_store = DataStore.from_dir('$GAMMAPY_EXTRA/datasets/hess-crab4-pa')
+@requires_data()
+def test_datastore_from_dir():
+    """Test the `from_dir` method."""
+    data_store_rel_path = DataStore.from_dir(
+        "$GAMMAPY_DATA/hess-dl3-dr1/", "hdu-index.fits.gz", "obs-index.fits.gz"
+    )
 
-    obs = data_store.obs(obs_id=23523)
-    filename = str(obs.location(hdu_type='bkg').path(abs_path=False))
-    assert filename == 'background/bgmodel_alt7_az0.fits.gz'
+    data_store_abs_path = DataStore.from_dir(
+        "$GAMMAPY_DATA/hess-dl3-dr1/",
+        "$GAMMAPY_DATA/hess-dl3-dr1/hdu-index.fits.gz",
+        "$GAMMAPY_DATA/hess-dl3-dr1/obs-index.fits.gz",
+    )
 
-    # assert str(type((obs.events))) == "<class 'gammapy.data.event_list.EventList'>"
-    # TODO: GTI is not listed in PA HDU index table.
-    # For now maybe add a workaround to find it in the same file as the events HDU?
-    # assert str(type(obs.gti)) == "<class 'gammapy.data.gti.GTI'>"
-    assert str(type(obs.aeff)) == "<class 'gammapy.irf.effective_area.EffectiveAreaTable2D'>"
-    assert str(type(obs.edisp)) == "<class 'gammapy.irf.energy_dispersion.EnergyDispersion2D'>"
-    assert str(type(obs.psf)) == "<class 'gammapy.irf.psf_king.PSFKing'>"
-
-    # TODO: Background model loading doesn't work yet
-    # ValueError: Expecting X axis in first 2 places, not (DETX_LO, DETX_HI)
-    # assert str(type(obs.bkg)) == ""
+    assert "Data store" in data_store_rel_path.info(show=False)
+    assert "Data store" in data_store_abs_path.info(show=False)
 
 
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_datastore_construction():
-    """Construct DataStore objects in various ways"""
-    data_store = DataStore.from_dir('$GAMMAPY_EXTRA/datasets/hess-crab4-hd-hap-prod2/')
-    data_store.info()
+@requires_data()
+def test_datastore_from_file(tmpdir):
+    filename = "$GAMMAPY_DATA/hess-dl3-dr1/hdu-index.fits.gz"
+    index_hdu = fits.open(make_path(filename))["HDU_INDEX"]
 
-    DataManager.DEFAULT_CONFIG_FILE = gammapy_extra.filename('datasets/data-register.yaml')
-    data_store = DataStore.from_name('hess-crab4-hd-hap-prod2')
-    data_store.info()
+    filename = "$GAMMAPY_DATA/hess-dl3-dr1/obs-index.fits.gz"
+    obs_hdu = fits.open(make_path(filename))["OBS_INDEX"]
+
+    hdulist = fits.HDUList()
+    hdulist.append(index_hdu)
+    hdulist.append(obs_hdu)
+
+    filename = tmpdir / "test-index.fits"
+    hdulist.writeto(str(filename))
+
+    data_store = DataStore.from_file(filename)
+
+    assert data_store.obs_table["OBS_ID"][0] == 20136
 
 
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_datastore_load_all(data_manager):
+@requires_data()
+def test_datastore_get_observations(data_store, caplog):
     """Test loading data and IRF files via the DataStore"""
-    data_store = data_manager['hess-crab4-hd-hap-prod2']
-    event_lists = data_store.load_all(hdu_class='events')
-    assert_allclose(event_lists[0].table['ENERGY'][0], 1.1156039)
-    assert_allclose(event_lists[-1].table['ENERGY'][0], 1.0204216)
-
-
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_datastore_obslist(data_manager):
-    """Test loading data and IRF files via the DataStore"""
-    data_store = data_manager['hess-crab4-hd-hap-prod2']
-    obslist = data_store.obs_list([23523, 23592])
-    assert obslist[0].obs_id == 23523
+    observations = data_store.get_observations([23523, 23592])
+    assert observations[0].obs_id == 23523
+    observations = data_store.get_observations()
+    assert len(observations) == 105
 
     with pytest.raises(ValueError):
-        obslist = data_store.obs_list([11111, 23592])
+        data_store.get_observations([11111, 23592])
 
-    obslist = data_store.obs_list([11111, 23523], skip_missing=True)
-    assert obslist[0].obs_id == 23523
+    with caplog.at_level(logging.WARNING):
+        observations = data_store.get_observations([11111, 23523], skip_missing=True)
+        assert observations[0].obs_id == 23523
+        assert "Skipping missing obs_id: 11111" in [_.message for _ in caplog.records]
+    with caplog.at_level(logging.INFO):
+        observations = data_store.get_observations([11111, 23523], skip_missing=True)
+        assert "Observations selected: 1 out of 2." in [
+            _.message for _ in caplog.records
+        ]
 
 
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_datastore_subset(tmpdir, data_manager):
-    """Test creating a datastore as subset of another datastore"""
-    data_store = data_manager['hess-crab4-hd-hap-prod2']
-    selected_obs = data_store.obs_table.select_obs_id([23523, 23592])
-    storedir = tmpdir / 'substore'
-    data_store.copy_obs(selected_obs, storedir)
-    obs_id = [23523, 23592]
-    data_store.copy_obs(obs_id, storedir, clobber=True)
+@requires_data()
+def test_broken_links_datastore(data_store):
+    # Test that datastore without complete IRFs are properly loaded
+    hdu_table = data_store.hdu_table
+    index = np.where(hdu_table["OBS_ID"] == 23526)[0][0]
+    hdu_table.remove_row(index)
+    hdu_table._hdu_type_stripped = np.array([_.strip() for _ in hdu_table["HDU_TYPE"]])
+    observations = data_store.get_observations(
+        [23523, 23526], required_irf=["aeff", "edisp"]
+    )
+    assert len(observations) == 1
 
-    substore = DataStore.from_dir(storedir)
+    with pytest.raises(ValueError):
+        _ = data_store.get_observations([23523], required_irf=["xyz"])
 
-    assert str(substore.hdu_table.base_dir) == str(storedir)
+
+@requires_data()
+def test_datastore_copy_obs(tmp_path, data_store):
+    data_store.copy_obs([23523, 23592], tmp_path, overwrite=True)
+
+    substore = DataStore.from_dir(tmp_path)
+
+    assert str(substore.hdu_table.base_dir) == str(tmp_path)
     assert len(substore.obs_table) == 2
 
     desired = data_store.obs(23523)
@@ -114,133 +117,161 @@ def test_datastore_subset(tmpdir, data_manager):
 
     assert str(actual.events.table) == str(desired.events.table)
 
-    # Copy only certain HDU classes
-    storedir = tmpdir / 'substore2'
-    data_store.copy_obs(obs_id, storedir, hdu_class=['events'])
 
-    substore = DataStore.from_dir(storedir)
+@requires_data()
+def test_datastore_copy_obs_subset(tmp_path, data_store):
+    # Copy only certain HDU classes
+    data_store.copy_obs([23523, 23592], tmp_path, hdu_class=["events"])
+
+    substore = DataStore.from_dir(tmp_path)
     assert len(substore.hdu_table) == 2
 
 
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_data_summary(data_manager):
-    """Test data summary function"""
+@requires_data()
+class TestDataStoreChecker:
+    def setup(self):
+        self.data_store = DataStore.from_dir("$GAMMAPY_DATA/cta-1dc/index/gps")
 
-    data_store = data_manager['hess-crab4-hd-hap-prod2']
-    t = data_store.data_summary([23523, 23592])
-    assert t[0]['events'] == 620975
-    assert t[1]['edisp_2d'] == 28931
-
-    t = data_store.data_summary([23523, 23592], summed=True)
-    assert t[0]['psf_3gauss'] == 6042
+    def test_check_all(self):
+        records = list(self.data_store.check())
+        assert len(records) == 32
 
 
+@pytest.fixture()
+def data_store_dc1(monkeypatch):
+    paths = [
+        f"$GAMMAPY_DATA/cta-1dc/data/baseline/gps/gps_baseline_{obs_id:06d}.fits"
+        for obs_id in [110380, 111140, 111630, 111159]
+    ]
+    caldb_path = Path(os.environ["GAMMAPY_DATA"]) / Path("cta-1dc/caldb")
+    monkeypatch.setenv("CALDB", str(caldb_path))
+    return DataStore.from_events_files(paths)
 
-@requires_data('gammapy-extra')
-@requires_dependency('yaml')
-def test_data_store_observation():
-    """Test DataStoreObservation class"""
-    data_store = DataStore.from_dir('$GAMMAPY_EXTRA/datasets/hess-crab4-hd-hap-prod2/')
+
+@requires_data()
+def test_datastore_from_events(data_store_dc1):
+    # data_store_dc1 fixture is needed to set CALDB
+    # Test that `DataStore.from_events_files` works.
+    # The real tests for `DataStoreMaker` are below.
+    path = "$GAMMAPY_DATA/cta-1dc/data/baseline/gps/gps_baseline_110380.fits"
+    data_store = DataStore.from_events_files([path])
+    assert len(data_store.obs_table) == 1
+    assert len(data_store.hdu_table) == 6
+
+
+@requires_data()
+def test_datastoremaker_obs_table(data_store_dc1):
+    table = data_store_dc1.obs_table
+    assert table.__class__.__name__ == "ObservationTable"
+    assert len(table) == 4
+    assert len(table.colnames) == 22
+    assert table["CALDB"][0] == "1dc"
+    assert table["IRF"][0] == "South_z20_50h"
+    assert (
+        table["IRF_FILENAME"][0]
+        == "$CALDB/data/cta/1dc/bcf/South_z20_50h/irf_file.fits"
+    )
+
+    # TODO: implement https://github.com/gammapy/gammapy/issues/1218 and add tests here
+    # assert table.time_start[0].iso == "spam"
+    # assert table.time_start[-1].iso == "spam"
+
+
+@requires_data()
+def test_datastoremaker_hdu_table(data_store_dc1):
+    table = data_store_dc1.hdu_table
+    assert table.__class__.__name__ == "HDUIndexTable"
+    assert len(table) == 24
+    hdu_class = ["events", "gti", "aeff_2d", "edisp_2d", "psf_3gauss", "bkg_3d"]
+    assert list(data_store_dc1.hdu_table["HDU_CLASS"]) == 4 * hdu_class
+    assert table["FILE_DIR"][2] == "$CALDB/data/cta/1dc/bcf/South_z20_50h"
+
+
+@requires_data()
+def test_datastoremaker_observation(data_store_dc1):
+    """Check that one observation can be accessed OK"""
+
+    obs = data_store_dc1.obs(110380)
+    assert obs.obs_id == 110380
+
+    assert obs.events.time[0].iso == "2021-01-21 12:00:03.045"
+    assert obs.gti.time_start[0].iso == "2021-01-21 12:00:00.000"
+
+    assert obs.aeff.__class__.__name__ == "EffectiveAreaTable2D"
+    assert obs.bkg.__class__.__name__ == "Background3D"
+    assert obs.edisp.__class__.__name__ == "EnergyDispersion2D"
+    assert obs.psf.__class__.__name__ == "EnergyDependentMultiGaussPSF"
+
+
+@requires_data("gammapy-data")
+def test_datastore_fixed_rad_max():
+    data_store = DataStore.from_dir("$GAMMAPY_DATA/joint-crab/dl3/magic")
+    observations = data_store.get_observations(
+        [5029748], required_irf=["aeff", "edisp"]
+    )
+
+    assert len(observations) == 1
+    obs = observations[0]
+
+    assert obs.rad_max is not None
+    assert obs.rad_max.quantity.shape == (1, 1)
+    assert u.allclose(obs.rad_max.quantity, np.sqrt(0.02) * u.deg)
+
+    # test it also works with edisp (removing aeff)
+    obs = data_store.get_observations([5029748], required_irf=["aeff", "edisp"])[0]
+    obs.aeff = None
+    assert obs.rad_max is not None
+    assert obs.rad_max.quantity.shape == (1, 1)
+    assert u.allclose(obs.rad_max.quantity, 0.1414213 * u.deg)
+
+    # removing the last irf means we have no rad_max info
+    obs = data_store.get_observations([5029748], required_irf=["aeff", "edisp"])[0]
+    obs.aeff = None
+    obs.edisp = None
+    assert obs.rad_max is None
+
+
+@requires_data()
+def test_datastore_header_info_in_obs_info(data_store):
+    """Test information from the obs index header is propagated into obs_info"""
+    obs = data_store.obs(obs_id=23523)
+
+    assert "MJDREFI" in obs.obs_info
+    assert "MJDREFF" in obs.obs_info
+    assert "GEOLON" in obs.obs_info
+    assert "GEOLAT" in obs.obs_info
+    # make sure we don't add the OBS_INDEX HDUCLAS
+    assert "HDUCLAS1" not in obs.obs_info
+
+
+@requires_data()
+def test_datastore_bad_name():
+    with pytest.raises(IOError):
+        DataStore.from_dir("$GAMMAPY_DATA/hess-dl3-dr1/", "hdu-index.fits.gz", "bad")
+
+
+@requires_data()
+def test_datastore_from_dir_no_obs_index(caplog, tmpdir):
+    """Test the `from_dir` method."""
+
+    # Create small datastore and remove obs-index table
+    DataStore.from_dir("$GAMMAPY_DATA/hess-dl3-dr1/").copy_obs([23523, 23592], tmpdir)
+    os.remove(tmpdir / "obs-index.fits.gz")
+
+    data_store = DataStore.from_dir(tmpdir)
+
     obs = data_store.obs(23523)
+    observations = data_store.get_observations()
 
-    assert_time_allclose(obs.tstart, Time(51545.11740650318, scale='tt', format='mjd'))
-    assert_time_allclose(obs.tstop, Time(51545.11740672924, scale='tt', format='mjd'))
+    assert data_store.obs_table is None
+    assert "No observation index table." in data_store.info(show=False)
 
-    c = SkyCoord(83.63333129882812, 21.51444435119629, unit='deg')
-    assert_skycoord_allclose(obs.pointing_radec, c)
+    assert obs.obs_info["ONTIME"] == 1687.0
+    assert len(observations) == 2
 
-    c = SkyCoord(26.533863067626953, 40.60616683959961, unit='deg')
-    assert_skycoord_allclose(obs.pointing_altaz, c)
-
-    c = SkyCoord(83.63333129882812, 22.01444435119629, unit='deg')
-    assert_skycoord_allclose(obs.target_radec, c)
-
-
-@requires_dependency('scipy')
-@requires_data('gammapy-extra')
-@pytest.mark.parametrize("pars,result", [
-    (dict(energy=None, rad=None),
-     dict(energy_shape=18, rad_shape=300, psf_energy=2.5178505859375 * u.TeV,
-          psf_rad=0.05 * u.deg,
-          psf_exposure=Quantity(6878545291473.34, "cm2 s"),
-          psf_value=Quantity(1837.4367332530592, "1/sr"))),
-    (dict(energy=EnergyBounds.equal_log_spacing(1, 10, 100, "TeV"), rad=None),
-     dict(energy_shape=101, rad_shape=300,
-          psf_energy=1.2589254117941673 * u.TeV, psf_rad=0.05 * u.deg,
-          psf_exposure=Quantity(4622187644084.735, "cm2 s"),
-          psf_value=Quantity(1682.8135627097995, "1/sr"))),
-    (dict(energy=None, rad=Angle(np.arange(0, 2, 0.002), 'deg')),
-     dict(energy_shape=18, rad_shape=1000,
-          psf_energy=2.5178505859375 * u.TeV, psf_rad=0.02 * u.deg,
-          psf_exposure=Quantity(6878545291473.34, "cm2 s"),
-          psf_value=Quantity(20455.914082287516, "1/sr"))),
-    (dict(energy=EnergyBounds.equal_log_spacing(1, 10, 100, "TeV"),
-          rad=Angle(np.arange(0, 2, 0.002), 'deg')),
-     dict(energy_shape=101, rad_shape=1000,
-          psf_energy=1.2589254117941673 * u.TeV, psf_rad=0.02 * u.deg,
-          psf_exposure=Quantity(4622187644084.735, "cm2 s"),
-          psf_value=Quantity(25016.103907407552, "1/sr"))),
-])
-def test_make_psf(pars, result):
-    position = SkyCoord(83.63, 22.01, unit='deg')
-    store = gammapy_extra.filename("datasets/hess-crab4-hd-hap-prod2")
-    data_store = DataStore.from_dir(store)
-
-    obs1 = data_store.obs(23523)
-    psf = obs1.make_psf(position=position, energy=pars["energy"], rad=pars["rad"])
-
-    assert_allclose(psf.rad.shape, result["rad_shape"])
-    assert_allclose(psf.energy.shape, result["energy_shape"])
-    assert_allclose(psf.exposure.shape, result["energy_shape"])
-    assert_allclose(psf.psf_value.shape, (result["energy_shape"],
-                                          result["rad_shape"]))
-
-    assert_quantity_allclose(psf.rad[10], result["psf_rad"])
-    assert_quantity_allclose(psf.energy[10], result["psf_energy"])
-    assert_quantity_allclose(psf.exposure[10], result["psf_exposure"])
-    assert_quantity_allclose(psf.psf_value[10, 50], result["psf_value"])
-
-
-@requires_dependency('scipy')
-@requires_data('gammapy-extra')
-def test_make_mean_edisp():
-    position = SkyCoord(83.63, 22.01, unit='deg')
-    store = gammapy_extra.filename("datasets/hess-crab4-hd-hap-prod2")
-    data_store = DataStore.from_dir(store)
-
-    obs1 = data_store.obs(23523)
-    obs2 = data_store.obs(23592)
-    obslist = ObservationList([obs1, obs2])
-
-    e_true = EnergyBounds.equal_log_spacing(0.01, 150, 80, "TeV")
-    e_reco = EnergyBounds.equal_log_spacing(0.5, 100, 15, "TeV")
-    rmf = obslist.make_mean_edisp(position=position, e_true=e_true,
-                                  e_reco=e_reco)
-
-    assert len(rmf.e_true.nodes) == 80
-    assert len(rmf.e_reco.nodes) == 15
-    assert_quantity_allclose(rmf.data.data[53, 8], 0.056, atol=2e-2)
-
-    rmf2 = obslist.make_mean_edisp(position=position, e_true=e_true,
-                                   e_reco=e_reco,
-                                   low_reco_threshold=Energy(1, "TeV"),
-                                   high_reco_threshold=Energy(60, "TeV"))
-    i2 = np.where(rmf2.data.evaluate(e_reco=Energy(0.8, "TeV")) != 0)[0]
-    assert len(i2) == 0
-    i2 = np.where(rmf2.data.evaluate(e_reco=Energy(61, "TeV")) != 0)[0]
-    assert len(i2) == 0
-    i = np.where(rmf.data.evaluate(e_reco=Energy(1.5, "TeV")) != 0)[0]
-    i2 = np.where(rmf2.data.evaluate(e_reco=Energy(1.5, "TeV")) != 0)[0]
-    assert_equal(i, i2)
-    i = np.where(rmf.data.evaluate(e_reco=Energy(40, "TeV")) != 0)[0]
-    i2 = np.where(rmf2.data.evaluate(e_reco=Energy(40, "TeV")) != 0)[0]
-    assert_equal(i, i2)
-
-
-@requires_dependency('yaml')
-@requires_data('gammapy-extra')
-def test_check_observations(data_manager):
-    data_store = data_manager['hess-crab4-hd-hap-prod2']
-    result = data_store.check_observations()
-    assert len(result) == 0
+    test_dir = tmpdir / "test"
+    os.mkdir(test_dir)
+    data_store.copy_obs([23523], test_dir)
+    data_store_copy = DataStore.from_dir(test_dir)
+    assert len(data_store_copy.obs_ids) == 1
+    assert data_store_copy.obs_table == None

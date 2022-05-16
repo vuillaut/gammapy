@@ -2,14 +2,56 @@
 """
 Instrument response functions (IRFs).
 """
-from .effective_area import *
-from .background import *
-from .psf_core import *
-from .psf_table import *
-from .psf_3d import *
-from .psf_check import *
-from .psf_analytical import *
-from .psf_king import *
-from .energy_dispersion import *
-from .irf_stack import *
+from gammapy.utils.registry import Registry
+from .background import Background2D, Background3D
+from .core import FoVAlignment, IRFMap
+from .edisp import EDispKernel, EDispKernelMap, EDispMap, EnergyDispersion2D
+from .effective_area import EffectiveAreaTable2D
+from .io import load_cta_irfs, load_irf_dict_from_file
+from .psf import (
+    PSF3D,
+    EnergyDependentMultiGaussPSF,
+    ParametricPSF,
+    PSFKernel,
+    PSFKing,
+    PSFMap,
+)
+from .rad_max import RadMax2D
 
+__all__ = [
+    "Background2D",
+    "Background3D",
+    "EDispKernel",
+    "EDispKernelMap",
+    "EDispMap",
+    "EffectiveAreaTable2D",
+    "EnergyDependentMultiGaussPSF",
+    "EnergyDispersion2D",
+    "FoVAlignment",
+    "IRF_REGISTRY",
+    "IRFMap",
+    "load_cta_irfs",
+    "load_irf_dict_from_file",
+    "ParametricPSF",
+    "PSF3D",
+    "PSFKernel",
+    "PSFKing",
+    "PSFMap",
+]
+
+
+IRF_REGISTRY = Registry(
+    [
+        EffectiveAreaTable2D,
+        EnergyDispersion2D,
+        PSF3D,
+        EnergyDependentMultiGaussPSF,
+        PSFKing,
+        Background3D,
+        Background2D,
+        PSFMap,
+        EDispKernelMap,
+        RadMax2D,
+        EDispMap,
+    ]
+)

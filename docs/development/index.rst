@@ -1,26 +1,44 @@
 .. include:: ../references.txt
 
-.. _development:
+.. _dev:
 
-***********************
-Developer documentation
-***********************
+***********
+Development
+***********
 
 The developer documentation is a collection of notes for Gammapy developers and maintainers.
+If something is not covered here, have a look at the very extensive
+`Astropy developer documentation <http://docs.astropy.org/en/latest/#developer-documentation>`__,
+as well. If you want to contribute to Gammapy just use one of the `contact points <https://gammapy.org/contact.html>`__
+listed on the Gammapy webpage. Ideally you join directly the #dev channel in the Gammapy Slack.
 
-If something is not covered here, have a look at the very extensive Astropy developer documentation
-`here <http://docs.astropy.org/en/latest/#developer-documentation>`__,
-we do most things the same way.
-
-But you don't have to read all this stuff if you want to contribute something to Gammapy.
-
-We're happy to help out with any Gammapy-related questions or issues!
-
-Just :ref:`talk to us <development-contact>`!
-
+**Technical setup**
 
 .. toctree::
   :maxdepth: 1
 
-  howto
+  setup
+  dependencies
+
+**Contribution recipes**
+
+.. toctree::
+  :maxdepth: 1
+
+  intro
   release
+
+**How To**
+
+.. toctree::
+  :maxdepth: 1
+
+  doc_howto
+  dev_howto
+
+**Proposals for Improvement of Gammapy**
+
+.. toctree::
+  :maxdepth: 1
+
+  pigs/index

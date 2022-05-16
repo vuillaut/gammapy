@@ -5,101 +5,106 @@
 
 |
 
-.. _gammapy_welcome:
+Gammapy
+-------
+**Date**: |today| **Version**: |version|
 
-What is Gammapy?
-----------------
+**Useful links**:
+`Web page <https://gammapy.org>`__ |
+`Recipes <https://gammapy.github.io/gammapy-recipes>`__  |
+`Discussions <https://github.com/gammapy/gammapy/discussions>`__ |
+`Acknowledging <https://gammapy.org/acknowledging.html>`__ |
+`Contact <https://gammapy.org/contact.html>`__
 
-Gammapy is a community-developed, open-source Python package for gamma-ray astronomy.
 
-* Read the `Gammapy documentation`_.
-* Ask questions on the `Gammapy mailing list`_.
-* Request features, report bugs or contribute on the `Gammapy GitHub page`_.
-* Gammapy works with Python 2 and 3, on Linux, Mac OS X and (partly) Windows.
+Gammapy is a community-developed, open-source Python package for gamma-ray
+astronomy built on Numpy, Scipy and Astropy. **It is the core library for the** `CTA`_ **Science Tools**
+but can also be used to analyse data from existing imaging atmospheric Cherenkov telescopes
+(IACTs), such as `H.E.S.S.`_, `MAGIC`_ and `VERITAS`_. It also provides some support
+for `Fermi-LAT`_ and `HAWC`_ data analysis.
 
-Getting started
----------------
+Gammapy v0.20 is the release candidate for v1.0 and is considered feature complete.
 
-.. note::
+.. panels::
+    :card: + intro-card text-center
+    :column: col-lg-6 col-md-6 col-sm-6 col-xs-12 d-flex
 
-    Start learning about Gammapy using the :ref:`tutorials`.
+    ---
+    :img-top: _static/index_getting_started.svg
 
-Other introductory pages:
+    Getting started
+    ^^^^^^^^^^^^^^^
 
-* To install Gammapy, see the instructions on the :ref:`install` page.
-* To learn more about Gammapy, have a look at the :ref:`about` page.
-* The :ref:`getting-started` Sphinx page.
+    New to *Gammapy*? Check out the getting started documents. They contain information
+    on how to install and start using *Gammapy* on your local desktop computer.
 
-.. _gammapy_general_docs:
+    +++
 
-General documentation
----------------------
+    .. link-button:: getting-started/index
+            :type: ref
+            :text: To the quickstart docs
+            :classes: btn-block btn-secondary stretched-link
+
+    ---
+    :img-top: _static/index_user_guide.svg
+
+    User guide
+    ^^^^^^^^^^
+
+    The user guide provide in-depth information on the
+    key concepts of Gammapy with useful background information and explanation,
+    as well as tutorials in the form of Jupyter notebooks.
+
+    +++
+
+    .. link-button:: userguide/index
+            :type: ref
+            :text: To the user guide
+            :classes: btn-block btn-secondary stretched-link
+
+    ---
+    :img-top: _static/index_api.svg
+
+    API reference
+    ^^^^^^^^^^^^^
+
+    The reference guide contains a detailed description of
+    the Gammapy API. The reference describes how the methods work and which parameters can
+    be used. It assumes that you have an understanding of the key concepts.
+
+    +++
+
+    .. link-button:: api-ref
+            :type: ref
+            :text: To the reference guide
+            :classes: btn-block btn-secondary stretched-link
+
+    ---
+    :img-top: _static/index_contribute.svg
+
+    Developer guide
+    ^^^^^^^^^^^^^^^
+
+    Saw a typo in the documentation? Want to improve
+    existing functionalities? The contributing guidelines will guide
+    you through the process of improving Gammapy.
+
+    +++
+
+    .. link-button:: development/intro
+            :type: ref
+            :text: To the developer guide
+            :classes: btn-block btn-secondary stretched-link
+
 
 .. toctree::
-  :maxdepth: 1
+    :maxdepth: 1
+    :titlesonly:
+    :hidden:
 
-  about
-  install/index
-  getting-started
-  dataformats/index
-  references
-  development/index
-  changelog
-
-.. _gammapy_notebooks:
-
-Tutorial notebooks
-------------------
-
-.. toctree::
-  :maxdepth: 1
-
-  notebooks
-
-.. _gammapy_toolbox:
-
-The Gammapy toolbox
--------------------
-
-.. toctree::
-  :maxdepth: 1
-
-  scripts/index
-  astro/index
-  background/index
-  catalog/index
-  cube/index
-  data/index
-  datasets/index
-  detect/index
-  image/index
-  irf/index
-  spectrum/index
-  stats/index
-  time/index
-  utils/index
-  maps/index
-
-.. _gammapy_news:
-
-News
-----
-
-To get notifications for Gammapy releases, join the `Gammapy mailing list`_.
-
-* April 28, 2017 --- Gammapy **0.6** release. See changelog: :ref:`gammapy_0p6_release`
-* February 2017 --- `Gammapy workshop in Paris <https://github.com/gammapy/gammapy-meetings/blob/master/2017-02_Paris.md>`__
-* November 22, 2016 --- Gammapy **0.5** release. See changelog: :ref:`gammapy_0p5_release`
-* July 2016 --- `Gammapy poster at Gamma 2016`_
-* June 2016 --- `First Gammapy coding sprint`_ at MPIK, Heidelberg
-* June 2016 --- Gammapy is used to build `gamma-sky.net`_
-* May - August 2016 --- `Olga Vorokh GSoC 2016 on image analysis and source detection`_
-* May 2016 --- `First Gammapy presentation at a CTA meeting`_
-* April 20, 2016 --- Gammapy **0.4** release. See changelog: :ref:`gammapy_0p4_release`
-* April 7, 2016 --- Gammapy presentation at the `April 2016 IACT data meeting`_
-* November 16 - 20, 2015 --- `Python for gamma-ray astronomy 2015`_ workshop at MPIK, Heidelberg
-* August 13, 2015 --- Gammapy **0.3** release. See changelog: :ref:`gammapy_0p3_release`
-* August 2015 --- `Gammapy poster and proceeding at ICRC 2015`_
-* May - August 2015 --- `Manuel Paz Arribas GSoC 2015 on observation handling and cube background modeling`_
-* April 13, 2015 --- Gammapy **0.2** release. See changelog: :ref:`gammapy_0p2_release`
-* August 25, 2014 --- Gammapy **0.1** release. See changelog: :ref:`gammapy_0p1_release`
+    getting-started/index
+    userguide/index
+    tutorials/index
+    api.rst
+    development/index
+    changelog/index

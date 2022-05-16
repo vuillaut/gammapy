@@ -1,22 +1,14 @@
 """Plot Fermi PSF."""
-import matplotlib.pyplot as plt
-from astropy import units as u
-from gammapy.datasets import FermiGalacticCenter
-from gammapy.irf import EnergyDependentTablePSF
-from gammapy.image import SkyImage
+from gammapy.irf import PSFMap
+from gammapy.maps import MapAxis, WcsGeom
 
-filename = FermiGalacticCenter.filenames()['psf']
-fermi_psf = EnergyDependentTablePSF.read(filename)
+filename = "$GAMMAPY_DATA/fermi_3fhl/fermi_3fhl_psf_gc.fits.gz"
+psf = PSFMap.read(filename, format="gtpsf")
 
-fig = plt.figure(figsize=(6, 5))
+axis = MapAxis.from_energy_bounds("10 GeV", "2 TeV", nbin=20, name="energy_true")
+geom = WcsGeom.create(npix=50, binsz=0.01, axes=[axis])
 
-# Compute a PSF kernel image
-# TODO: change this example after introducing PSF kernel class
-# (using SkyImage this way for kernels is weird)
-psf_image = SkyImage.empty()
-energy = 1 * u.GeV
-psf = fermi_psf.table_psf_at_energy(energy=energy)
-psf_image.data = psf.kernel(psf_image, rad_max=1 * u.deg).value
-psf_image.plot(fig=fig, add_cbar=True)
+# .to_image() computes the exposure weighted mean PSF
+kernel = psf.get_psf_kernel(geom=geom).to_image()
 
-plt.show()
+kernel.psf_kernel_map.plot()

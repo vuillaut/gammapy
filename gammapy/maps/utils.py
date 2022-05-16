@@ -1,135 +1,98 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import absolute_import, division, print_function, unicode_literals
-from astropy.io import fits
-from ..utils.random import get_random_state
+import numpy as np
+from astropy import units as u
+from astropy.coordinates import Angle
 
 
-def fill_poisson(map_in, mu, random_state='random-seed'):
-    """Fill a map object with a poisson random variable.
+def _check_width(width):
+    """Check and normalise width argument.
 
-    This can be useful for testing, to make a simulated counts image.
-    E.g. filling with ``mu=0.5`` fills the map so that many pixels
-    have value 0 or 1, and a few more "counts".
-
-    Parameters
-    ----------
-    map_in : `~gammapy.maps.MapBase`
-        Input map
-    mu : scalar or `~numpy.ndarray`
-        Expectation value
-    random_state : {int, 'random-seed', 'global-rng', `~numpy.random.RandomState`}
-        Defines random number generator initialisation.
-        Passed to `~gammapy.utils.random.get_random_state`.
+    Always returns tuple (lon, lat) as float in degrees.
     """
-    random_state = get_random_state(random_state)
-    idx = map_in.geom.get_idx(flat=True)
-    mu = random_state.poisson(mu, idx[0].shape)
-    map_in.fill_by_idx(idx, mu)
+    if isinstance(width, tuple):
+        lon = Angle(width[0], "deg").deg
+        lat = Angle(width[1], "deg").deg
+        return lon, lat
+    else:
+        angle = Angle(width, "deg").deg
+        if np.isscalar(angle):
+            return angle, angle
+        else:
+            return tuple(angle)
 
 
-def swap_byte_order(arr_in):
-    """Swap the byte order of a numpy array to the native one.
+def _check_binsz(binsz):
+    """Check and normalise bin size argument.
 
-    Parameters
-    ----------
-    arr_in : `~numpy.ndarray`
-        Input array.
-
-    Returns
-    -------
-    arr_out : `~numpy.ndarray`
-        Array with native byte order.
+    Always returns an object with the same shape
+    as the input where the spatial coordinates
+    are a float in degrees.
     """
-    if arr_in.dtype.byteorder not in ('=', '|'):
-        return arr_in.byteswap().newbyteorder()
-
-    return arr_in
-
-
-def interp_to_order(interp):
-    """Convert interpolation string to order."""
-    if isinstance(interp, int):
-        return interp
-
-    order_map = {
-        None: 0,
-        'nearest': 0,
-        'linear': 1,
-        'quadratic': 2,
-        'cubic': 3,
-    }
-    return order_map.get(interp, None)
+    if isinstance(binsz, tuple):
+        lon_sz = Angle(binsz[0], "deg").deg
+        lat_sz = Angle(binsz[1], "deg").deg
+        return lon_sz, lat_sz
+    elif isinstance(binsz, list):
+        binsz[:2] = Angle(binsz[:2], unit="deg").deg
+        return binsz
+    return Angle(binsz, unit="deg").deg
 
 
-def unpack_seq(seq, n=1):
-    """Utility to unpack the first N values of a tuple or list.  Remaining
-    values are put into a single list which is the last element of the
-    return value.  This partially simulates the extended unpacking
-    functionality available in Python 3.
-
-    Parameters
-    ----------
-    seq : list or tuple
-        Input sequence to be unpacked.
-    n : int
-        Number of elements of ``seq`` to unpack.  Remaining elements
-        are put into a single tuple.
-    """
-    for row in seq:
-        yield [e for e in row[:n]] + [row[n:]]
+def coordsys_to_frame(coordsys):
+    if coordsys in ["CEL", "C"]:
+        return "icrs"
+    elif coordsys in ["GAL", "G"]:
+        return "galactic"
+    else:
+        raise ValueError(f"Unknown coordinate system: '{coordsys}'")
 
 
-def find_bands_hdu(hdulist, hdu):
-    """Discover the extension name of the BANDS HDU.
-
-    Returns
-    -------
-    extname : str
-        Extension name of the BANDS HDU.  None if no BANDS HDU was found.
-    """
-    if 'BANDSHDU' in hdu.header:
-        return hdu.header['BANDSHDU']
-
-    has_cube_data = False
-
-    if (isinstance(hdu, (fits.ImageHDU, fits.PrimaryHDU)) and
-            hdu.header.get('NAXIS', None) == 3):
-        has_cube_data = True
-    elif isinstance(hdu, fits.BinTableHDU):
-
-        if (hdu.header.get('INDXSCHM', '') in ['IMPLICIT', ''] and
-                len(hdu.columns) > 1):
-            has_cube_data = True
-
-    if has_cube_data:
-        if 'EBOUNDS' in hdulist:
-            return 'EBOUNDS'
-        elif 'ENERGIES' in hdulist:
-            return 'ENERGIES'
-
-    return None
+def frame_to_coordsys(frame):
+    if frame in ["icrs", "fk5", "fk4"]:
+        return "CEL"
+    elif frame in ["galactic"]:
+        return "GAL"
+    else:
+        raise ValueError(f"Unknown coordinate frame '{frame}'")
 
 
-def find_hdu(hdulist):
-    """Find the first non-empty HDU."""
-    for hdu in hdulist:
-        if hdu.data is not None:
-            return hdu
+class InvalidValue:
+    """Class to define placeholder for invalid array values."""
 
-    raise AttributeError('No Image or BinTable HDU found.')
+    float = np.nan
+    int = np.nan
+    bool = np.nan
+
+    def __getitem__(self, dtype):
+        if np.issubdtype(dtype, np.integer):
+            return self.int
+        elif np.issubdtype(dtype, np.floating):
+            return self.float
+        elif np.issubdtype(dtype, np.dtype(bool).type):
+            return self.bool
+        else:
+            raise ValueError(f"No invalid value placeholder defined for {dtype}")
 
 
-def find_image_hdu(hdulist):
-    for hdu in hdulist:
-        if hdu.data is not None and isinstance(hdu, fits.ImageHDU):
-            return hdu
+class InvalidIndex:
+    """Class to define placeholder for invalid array indices."""
 
-    raise AttributeError('No Image HDU found.')
+    float = np.nan
+    int = -1
+    bool = False
 
 
-def find_bintable_hdu(hdulist):
-    for hdu in hdulist:
-        if hdu.data is not None and isinstance(hdu, fits.BinTableHDU):
-            return hdu
+INVALID_VALUE = InvalidValue()
+INVALID_INDEX = InvalidIndex()
 
-    raise AttributeError('No BinTable HDU found.')
+
+def edges_from_lo_hi(edges_lo, edges_hi):
+    if np.isscalar(edges_lo.value) and np.isscalar(edges_hi.value):
+        return u.Quantity([edges_lo, edges_hi])
+
+    edges = edges_lo.copy()
+    try:
+        edges = edges.insert(len(edges), edges_hi[-1])
+    except AttributeError:
+        edges = np.insert(edges, len(edges), edges_hi[-1])
+    return edges

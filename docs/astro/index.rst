@@ -1,36 +1,19 @@
-.. _astro:
+.. _api_astro:
 
-**************************************************************
-Astrophysical source and population models (``gammapy.astro``)
-**************************************************************
+********************
+astro - Astrophysics
+********************
 
 .. currentmodule:: gammapy.astro
 
-Introduction
-============
+.. automodapi:: gammapy.astro.darkmatter
+    :no-inheritance-diagram:
+    :include-all-objects:
 
-Common astrophysical source and population models are implemented in
-`gammapy.astro.source` and `gammapy.astro.population`.
+.. automodapi:: gammapy.astro.population
+    :no-inheritance-diagram:
+    :include-all-objects:
 
-The ``gammapy.astro`` namespace is empty ... use these import statements:
-
-.. code-block:: python
-
-   from gammapy.astro import source
-   from gammapy.astro import population
-
-
-Getting Started
-===============
-
-TODO: Add example Galactic gamma-ray source population model (catalog distributions, flux image, significance images)
-
-Sub-packages
-============
-
-.. toctree::
-  :maxdepth: 1
-
-  source/index
-  population/index
-
+.. automodapi:: gammapy.astro.source
+    :no-inheritance-diagram:
+    :include-all-objects:
